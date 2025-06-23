@@ -74,6 +74,8 @@ Follow these guidelines:
 5. NEVER use dangerous SQL operations (DROP, DELETE, UPDATE, INSERT, ALTER, etc.)
 6. Return ONLY the SQL query without any explanation or markdown formatting
 7. Only use tables and columns that exist in the schema above
+8. Always use the primary keys of the tables to fetch, later it can be removed from the table view if the user doesn't want to see it
+9. GROUP BY operations should also be used with the primary keys of the tables when applicable
 """
         )
         
