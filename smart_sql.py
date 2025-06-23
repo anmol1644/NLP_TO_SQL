@@ -111,6 +111,9 @@ Convert the following question into a single PostgreSQL SQL query:
 10. For follow-up questions or refinements, maintain the filters and conditions from the previous query
 11. If the follow-up question is only changing which columns to display, KEEP ALL WHERE CONDITIONS from the previous query
 12. When user asks for "this" or refers to previous results implicitly, use the context from the previous query
+13. When user refers to "those" or "these" results with terms like "highest" or "lowest", ONLY consider the exact rows from the previous result set, NOT the entire table
+14. If IDs from previous results are provided in the memory context, use them in a WHERE clause to limit exactly to those rows
+15. Only those tables must be joined that have a foreign key relationship with the table being queried
 
 ### OUTPUT FORMAT:
 Provide ONLY the SQL query with no additional text, explanation, or markdown formatting.
@@ -969,6 +972,41 @@ WHERE (
         
         return important_values
 
+    def _extract_sql_conditions(self, sql: str) -> str:
+        """Extract WHERE, HAVING, JOIN conditions, and LIMIT/ORDER BY clauses from SQL"""
+        conditions = []
+        
+        # Extract WHERE clause
+        where_match = re.search(r'WHERE\s+(.*?)(?:GROUP BY|ORDER BY|LIMIT|$)', sql, re.IGNORECASE | re.DOTALL)
+        if where_match:
+            conditions.append(f"WHERE {where_match.group(1).strip()}")
+            
+        # Extract HAVING clause
+        having_match = re.search(r'HAVING\s+(.*?)(?:ORDER BY|LIMIT|$)', sql, re.IGNORECASE | re.DOTALL)
+        if having_match:
+            conditions.append(f"HAVING {having_match.group(1).strip()}")
+            
+        # Extract JOIN conditions
+        join_matches = re.finditer(r'(INNER|LEFT|RIGHT|FULL|OUTER)?\s*JOIN\s+(\S+)\s+(?:AS\s+\w+\s+)?ON\s+(.*?)(?=(?:LEFT|RIGHT|INNER|FULL|OUTER)?\s*JOIN|\s+WHERE|\s+GROUP|\s+ORDER|\s+LIMIT|$)', 
+                                 sql, re.IGNORECASE | re.DOTALL)
+        for match in join_matches:
+            join_type = match.group(1) or "JOIN"
+            table = match.group(2)
+            join_condition = match.group(3).strip()
+            conditions.append(f"{join_type} {table} ON {join_condition}")
+        
+        # Extract ORDER BY clause
+        order_match = re.search(r'ORDER BY\s+(.*?)(?:LIMIT|$)', sql, re.IGNORECASE | re.DOTALL)
+        if order_match:
+            conditions.append(f"ORDER BY {order_match.group(1).strip()}")
+            
+        # Extract LIMIT clause
+        limit_match = re.search(r'LIMIT\s+(\d+)', sql, re.IGNORECASE)
+        if limit_match:
+            conditions.append(f"LIMIT {limit_match.group(1).strip()}")
+            
+        return "; ".join(conditions)
+        
     def _prepare_session_context_for_query(self, question: str) -> str:
         """
         Prepare relevant session context for the current query
@@ -1005,6 +1043,15 @@ WHERE (
             "top", "bottom", "each", "both", "two"
         ]
         
+        # Check for superlative terms that might reference previous result set
+        superlative_terms = [
+            "highest", "lowest", "most", "least", "best", "worst", "largest", "smallest",
+            "maximum", "minimum", "max", "min"
+        ]
+        
+        # Check if query contains references to "those" or other terms that imply previous result set
+        has_result_set_reference = any(f"{term} " in f" {question.lower()} " for term in ["those", "these", "them"])
+        
         # Check for implicit references or refinement patterns
         refinement_starters = [
             "just", "only", "show", "list", "give", "select", "filter",
@@ -1017,6 +1064,7 @@ WHERE (
         is_refinement = False
         is_reference = any(term in question.lower() for term in reference_terms)
         is_comparison = any(term in question.lower() for term in comparison_terms)
+        is_superlative = any(term in question.lower() for term in superlative_terms)
         
         # Check if it starts with a refinement word
         if any(question.lower().startswith(term) for term in refinement_starters):
@@ -1065,14 +1113,29 @@ WHERE (
                     if last_result["results"][0]:
                         last_query_str += ", ".join(last_result["results"][0].keys())
                     last_query_str += "\n"
+                    
+                    # If there's a reference to "those" or similar terms AND the previous query used LIMIT
+                    if has_result_set_reference and "LIMIT" in last_result['sql'].upper():
+                        last_query_str += "\nIMPORTANT: When referring to 'those' or 'these' results, you MUST preserve the exact same result set from the previous query.\n"
+                        
+                        # Extract IDs if available
+                        if last_result["results"] and "salesorderid" in last_result["results"][0]:
+                            ids = [str(row["salesorderid"]) for row in last_result["results"]]
+                            last_query_str += f"Previous result set contains ONLY these IDs: {', '.join(ids)}\n"
+                            last_query_str += "Use these exact IDs in a WHERE clause: WHERE salesorderid IN (" + ', '.join(ids) + ")\n"
             
             context_parts.append(last_query_str)
         
         # For refinements or references, add more context about previous queries
-        if is_refinement or is_reference:
+        if is_refinement or is_reference or is_superlative:
             # Add specific guidance for refinements
             guidance = "GUIDANCE FOR REFINEMENT:\n"
-            if is_refinement and not is_reference:
+            
+            if has_result_set_reference and is_superlative:
+                guidance += "CRITICAL: This query refers to the SPECIFIC SET of results from the previous query. "
+                guidance += "Do NOT run a new query against the entire table. "
+                guidance += "You MUST restrict the query to ONLY the exact rows returned by the previous query.\n"
+            elif is_refinement and not is_reference:
                 guidance += "This appears to be a refinement of the previous query. "
                 guidance += "Maintain the same filters and conditions from the previous query, "
                 guidance += "but modify the output columns or presentation according to the new request.\n"
@@ -1134,31 +1197,6 @@ WHERE (
                 context_parts.append(comparison_context)
             
         return "\n".join(context_parts)
-        
-    def _extract_sql_conditions(self, sql: str) -> str:
-        """Extract WHERE, HAVING, and JOIN conditions from SQL"""
-        conditions = []
-        
-        # Extract WHERE clause
-        where_match = re.search(r'WHERE\s+(.*?)(?:GROUP BY|ORDER BY|LIMIT|$)', sql, re.IGNORECASE | re.DOTALL)
-        if where_match:
-            conditions.append(f"WHERE {where_match.group(1).strip()}")
-            
-        # Extract HAVING clause
-        having_match = re.search(r'HAVING\s+(.*?)(?:ORDER BY|LIMIT|$)', sql, re.IGNORECASE | re.DOTALL)
-        if having_match:
-            conditions.append(f"HAVING {having_match.group(1).strip()}")
-            
-        # Extract JOIN conditions
-        join_matches = re.finditer(r'(INNER|LEFT|RIGHT|FULL|OUTER)?\s*JOIN\s+(\S+)\s+(?:AS\s+\w+\s+)?ON\s+(.*?)(?=(?:LEFT|RIGHT|INNER|FULL|OUTER)?\s*JOIN|\s+WHERE|\s+GROUP|\s+ORDER|\s+LIMIT|$)', 
-                                 sql, re.IGNORECASE | re.DOTALL)
-        for match in join_matches:
-            join_type = match.group(1) or "JOIN"
-            table = match.group(2)
-            join_condition = match.group(3).strip()
-            conditions.append(f"{join_type} {table} ON {join_condition}")
-            
-        return "; ".join(conditions)
         
     def _extract_sql_tables(self, sql: str) -> List[str]:
         """Extract table names from SQL query"""

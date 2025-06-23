@@ -4,4 +4,10 @@ langchain
 langchain-google-genai
 python-dotenv
 pandas
-psycopg2-binary 
+psycopg2-binary
+langchain_community
+chroma
+fastapi>=0.104.1
+uvicorn>=0.24.0
+pydantic>=2.4.2
+requests>=2.31.0 
