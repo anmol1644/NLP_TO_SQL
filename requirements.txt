@@ -1,0 +1,7 @@
+sqlalchemy
+google-generativeai
+langchain
+langchain-google-genai
+python-dotenv
+pandas
+psycopg2-binary 
