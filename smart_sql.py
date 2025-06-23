@@ -55,7 +55,8 @@ class SmartSQLGenerator:
         self.llm = ChatGoogleGenerativeAI(
             model=model_name,
             temperature=0, 
-            google_api_key=api_key
+            google_api_key=api_key,
+            convert_system_message_to_human=True
         )
         
         # Define SQL generation prompt

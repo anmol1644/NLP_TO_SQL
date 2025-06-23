@@ -1,24 +1,8 @@
 import os
 import pandas as pd
-from sqlalchemy import create_engine, inspect, MetaData, text, types
+from sqlalchemy import create_engine, inspect, MetaData, text
 from sqlalchemy.ext.automap import automap_base
 from typing import Dict, List, Any, Tuple, Optional
-
-
-# Define a custom type for PostgreSQL XML
-class PostgreSQLXML(types.UserDefinedType):
-    def get_col_spec(self, **kw):
-        return "XML"
-    
-    def bind_processor(self, dialect):
-        def process(value):
-            return value
-        return process
-    
-    def result_processor(self, dialect, coltype):
-        def process(value):
-            return value
-        return process
 
 
 class DatabaseAnalyzer:
@@ -45,10 +29,6 @@ class DatabaseAnalyzer:
             host: PostgreSQL host
             port: PostgreSQL port
         """
-        # Register PostgreSQL XML type
-        from sqlalchemy.dialects import postgresql
-        postgresql.base.ischema_names['xml'] = PostgreSQLXML
-        
         self.db_name = db_name
         self.connection_string = f"postgresql://{username}:{password}@{host}:{port}/{db_name}"
         self.engine = create_engine(self.connection_string)
@@ -185,49 +165,15 @@ class DatabaseAnalyzer:
             col_name = column["name"]
             col_type = column["type"].lower()
             
-            # Initialize stats dictionary
+            # Skip BLOB, JSON, etc.
+            if any(t in col_type for t in ["blob", "bytea", "json", "xml"]):
+                continue
+            
             stats = {}
             
             try:
-                # Special handling for XML columns
-                if "xml" in col_type:
-                    # Add XML-specific metadata
-                    stats["is_xml"] = True
-                    
-                    # Count non-null values
-                    result = connection.execute(text(
-                        f"SELECT COUNT(*) FROM \"{schema_name}\".\"{table_name}\" "
-                        f"WHERE \"{col_name}\" IS NOT NULL"
-                    ))
-                    non_null_count = result.scalar() or 0
-                    stats["non_null_count"] = non_null_count
-                    
-                    # Calculate null percentage
-                    result = connection.execute(text(
-                        f"SELECT (COUNT(*) - COUNT(\"{col_name}\")) * 100.0 / COUNT(*) "
-                        f"FROM \"{schema_name}\".\"{table_name}\""
-                    ))
-                    null_percentage = result.scalar() or 0
-                    stats["null_percentage"] = null_percentage
-                    
-                    # Only attempt to analyze XML content if there's data
-                    if non_null_count > 0:
-                        # Get sample of the XML structure
-                        result = connection.execute(text(
-                            f"SELECT \"{col_name}\"::text FROM \"{schema_name}\".\"{table_name}\" "
-                            f"WHERE \"{col_name}\" IS NOT NULL LIMIT 1"
-                        ))
-                        sample = result.scalar()
-                        if sample:
-                            # Store a truncated sample (first 200 chars)
-                            stats["sample"] = sample[:200] + "..." if len(sample) > 200 else sample
-                    
-                # Skip other BLOB data types
-                elif any(t in col_type for t in ["blob", "bytea", "json"]):
-                    continue
-                
-                # Analyze based on column type for non-XML columns
-                elif any(t in col_type for t in ["int", "double", "float", "numeric", "decimal"]):
+                # Analyze based on column type
+                if any(t in col_type for t in ["int", "double", "float", "numeric", "decimal"]):
                     # Numeric column analysis
                     result = connection.execute(text(
                         f"SELECT MIN(\"{col_name}\"), MAX(\"{col_name}\"), AVG(\"{col_name}\"), "
@@ -241,16 +187,16 @@ class DatabaseAnalyzer:
                         stats["avg"] = row[2]
                         stats["median"] = row[3]
                 
-                    # Analyze null percentage for all columns
-                    result = connection.execute(text(
-                        f"SELECT (COUNT(*) - COUNT(\"{col_name}\")) * 100.0 / COUNT(*) "
-                        f"FROM \"{schema_name}\".\"{table_name}\""
-                    ))
-                    null_percentage = result.scalar() or 0
-                    stats["null_percentage"] = null_percentage
+                # Analyze null percentage for all columns
+                result = connection.execute(text(
+                    f"SELECT (COUNT(*) - COUNT(\"{col_name}\")) * 100.0 / COUNT(*) "
+                    f"FROM \"{schema_name}\".\"{table_name}\""
+                ))
+                null_percentage = result.scalar() or 0
+                stats["null_percentage"] = null_percentage
                 
                 # For categorical columns, get distinct value count and top 5 values
-                elif any(t in col_type for t in ["char", "text", "enum", "bool"]) or "date" in col_type:
+                if any(t in col_type for t in ["char", "text", "enum", "bool"]) or "date" in col_type:
                     # Get distinct value count
                     result = connection.execute(text(
                         f"SELECT COUNT(DISTINCT \"{col_name}\") FROM \"{schema_name}\".\"{table_name}\""
@@ -272,23 +218,12 @@ class DatabaseAnalyzer:
                         for row in result:
                             top_values.append({"value": str(row[0]), "count": row[1]})
                         stats["top_values"] = top_values
-                    
-                    # Analyze null percentage
-                    result = connection.execute(text(
-                        f"SELECT (COUNT(*) - COUNT(\"{col_name}\")) * 100.0 / COUNT(*) "
-                        f"FROM \"{schema_name}\".\"{table_name}\""
-                    ))
-                    null_percentage = result.scalar() or 0
-                    stats["null_percentage"] = null_percentage
                 
                 # Update column info with statistics
                 table_info["columns"][i]["stats"] = stats
                 
             except Exception as e:
                 print(f"Error analyzing statistics for {schema_name}.{table_name}.{col_name}: {e}")
-                # Set error in stats
-                stats["error"] = str(e)
-                table_info["columns"][i]["stats"] = stats
     
     def _analyze_relationships(self, schema_names: List[str] = ["public"]) -> List[Dict[str, Any]]:
         """
@@ -411,131 +346,74 @@ class DatabaseAnalyzer:
     
     def get_rich_schema_context(self) -> str:
         """
-        Get a rich schema context for AI
+        Get a rich, detailed context about the database schema for the AI
         
         Returns:
-            A detailed string representation of the schema context
+            String with rich schema context
         """
         if not self.schema_info:
             self.analyze_schema()
+            
+        context_parts = [self.schema_info["summary"], ""]
         
-        context_parts = ["DATABASE SCHEMA:", ""]
+        # Get list of unique table references (avoid duplicates from schema qualified and non-qualified names)
+        # Prioritize unqualified table names for backward compatibility
+        seen_tables = set()
+        unique_tables = []
         
-        # Get the tables/views sorted by most important first
-        sorted_tables = []
+        # First add tables without schema prefix
         for table_name, table_info in self.schema_info["tables"].items():
-            if "." not in table_name:  # Use unqualified names only
-                row_count = table_info["row_count"]
-                
-                # Skip system tables or empty tables
-                if row_count == 0 or table_name.startswith(('pg_', 'sql_', 'information_schema')):
-                    continue
-                
-                sorted_tables.append((table_name, table_info, row_count))
+            if "." not in table_name:
+                unique_tables.append((table_name, table_info))
+                seen_tables.add(table_name.split(".")[-1])
         
-        # Sort by row count (most first)
-        sorted_tables.sort(key=lambda x: x[2] if isinstance(x[2], int) else 0, reverse=True)
+        # Then add qualified tables that haven't been seen yet
+        for table_name, table_info in self.schema_info["tables"].items():
+            if "." in table_name:
+                simple_name = table_name.split(".")[-1]
+                if simple_name not in seen_tables:
+                    unique_tables.append((table_name, table_info))
+                    seen_tables.add(simple_name)
         
-        # Generate table context
-        for table_name, table_info, row_count in sorted_tables:
-            # Table header
-            if isinstance(row_count, int) and row_count > 0:
-                context_parts.append(f"Table: {table_name} ({row_count:,} rows)")
-            else:
-                context_parts.append(f"Table: {table_name}")
-            
-            # Add columns
-            context_parts.append("Columns:")
-            for column in table_info["columns"]:
-                col_name = column["name"]
-                col_type = column["type"]
-                pk_marker = "PK" if column["primary_key"] else ""
-                nullable = "" if column["nullable"] else "NOT NULL"
-                
-                # Add special handling for XML column types
-                if "xml" in col_type.lower():
-                    context_parts.append(f"  - {col_name} (XML) {pk_marker} {nullable}")
-                    # Add any XML-specific information if available in stats
-                    if "stats" in column and column["stats"]:
-                        stats = column["stats"]
-                        if stats.get("sample"):
-                            # Add a small sample of the XML structure
-                            sample = stats["sample"]
-                            # Truncate sample to a reasonable size
-                            if len(sample) > 100:
-                                sample = sample[:100] + "..."
-                            context_parts.append(f"    [XML Sample Structure: {sample}]")
-                else:
-                    context_parts.append(f"  - {col_name} ({col_type}) {pk_marker} {nullable}")
-                    
-                # Add column stats for important columns (non-XML types)
-                if "xml" not in col_type.lower() and "stats" in column and column["stats"]:
-                    stats = column["stats"]
-                    
-                    # For numeric columns, show range
-                    if "min" in stats and "max" in stats:
-                        context_parts.append(f"    [Range: {stats['min']} to {stats['max']}]")
-                    
-                    # For categorical columns, show top values
-                    if "top_values" in stats and stats["top_values"]:
-                        top_values_str = ", ".join([f"{v['value']} ({v['count']})" for v in stats["top_values"][:3]])
-                        context_parts.append(f"    [Top values: {top_values_str}]")
-                    
-                    # For all columns, show null percentage if significant
-                    if "null_percentage" in stats and stats["null_percentage"] > 5:
-                        context_parts.append(f"    [NULL: {stats['null_percentage']:.1f}%]")
-            
-            # Add foreign keys
-            if table_info["foreign_keys"]:
-                context_parts.append("Foreign Keys:")
-                for fk in table_info["foreign_keys"]:
-                    src_cols = ", ".join(fk["constrained_columns"])
-                    ref_table = fk["referred_table"]
-                    ref_cols = ", ".join(fk["referred_columns"])
-                    context_parts.append(f"  - {src_cols} -> {ref_table}({ref_cols})")
-            
-            # Add indexes
-            if table_info["indexes"]:
-                context_parts.append("Indexes:")
-                for idx in table_info["indexes"]:
-                    idx_name = idx["name"]
-                    idx_cols = ", ".join(idx["column_names"])
-                    unique = "UNIQUE " if idx["unique"] else ""
-                    context_parts.append(f"  - {idx_name}: {unique}({idx_cols})")
-            
-            # Add a sample row if available
+        # Add sample data context for small tables
+        context_parts.append("SAMPLE DATA:")
+        for table_name, table_info in unique_tables:
             if table_info["sample_data"] and len(table_info["sample_data"]) > 0:
-                context_parts.append("Sample Data:")
-                sample = table_info["sample_data"][0]
-                sample_items = []
-                
-                for col, val in sample.items():
-                    # Don't include XML fields in the sample data output
-                    if any(c["name"] == col and "xml" in c["type"].lower() for c in table_info["columns"]):
-                        sample_items.append(f"{col}: [XML data]")
-                    else:
-                        # Truncate long values
-                        if isinstance(val, str) and len(val) > 50:
-                            val = val[:50] + "..."
-                        sample_items.append(f"{col}: {val}")
-                
-                context_parts.append("  " + ", ".join(sample_items))
-            
-            # Add separator between tables
-            context_parts.append("")
+                context_parts.append(f"\nTable: {table_name} (sample rows):")
+                df = pd.DataFrame(table_info["sample_data"])
+                sample_str = df.to_string(index=False)
+                if len(sample_str) < 1000:  # Only include if not too large
+                    context_parts.append(sample_str)
+                else:
+                    # Just show the columns and a few rows
+                    context_parts.append(str(df.head(2)))
         
-        # Add relationships
-        if self.schema_info["relationships"]:
-            context_parts.append("RELATIONSHIPS:")
+        # Add common query patterns based on schema
+        context_parts.append("\nCOMMON QUERY PATTERNS:")
+        
+        # Find tables that look like transaction tables (likely have date and numeric columns)
+        transaction_tables = []
+        for table_name, table_info in unique_tables:
+            col_types = [col["type"].lower() for col in table_info["columns"]]
+            has_date = any("date" in t or "time" in t for t in col_types)
+            has_numeric = any(t in "numeric decimal float double int" for t in " ".join(col_types))
+            if has_date and has_numeric:
+                transaction_tables.append(table_name)
+        
+        if transaction_tables:
+            context_parts.append("\n- Time series queries (for tables with date/time columns):")
+            for table in transaction_tables:
+                context_parts.append(f"  * Aggregate {table} data by date periods")
+        
+        # Look for tables with potential hierarchical relationships
+        if len(self.schema_info["relationships"]) > 0:
+            context_parts.append("\n- Joining related tables:")
             for rel in self.schema_info["relationships"]:
-                src_table = rel["source_table"]
-                src_cols = ", ".join(rel["source_columns"])
-                tgt_table = rel["target_table"]
-                tgt_cols = ", ".join(rel["target_columns"])
-                
-                context_parts.append(f"- {src_table}({src_cols}) -> {tgt_table}({tgt_cols})")
-            
-            context_parts.append("")
+                context_parts.append(
+                    f"  * Join {rel['source_schema']}.{rel['source_table']} with {rel['target_schema']}.{rel['target_table']} on "
+                    f"{rel['source_schema']}.{rel['source_table']}.{rel['source_columns'][0]} = "
+                    f"{rel['target_schema']}.{rel['target_table']}.{rel['target_columns'][0]}"
+                )
         
         return "\n".join(context_parts)
     
