@@ -10,6 +10,11 @@ from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains import LLMChain
 from langchain.prompts import PromptTemplate
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document
+from langchain.memory import VectorStoreRetrieverMemory
+from langchain.schema.memory import BaseMemory
 
 from db_analyzer import DatabaseAnalyzer
 
@@ -25,7 +30,9 @@ class SmartSQLGenerator:
         db_analyzer: DatabaseAnalyzer,
         model_name: str = "gemini-2.0-flash",
         use_cache: bool = True,
-        cache_file: str = "query_cache.json"
+        cache_file: str = "query_cache.json",
+        use_memory: bool = True,
+        memory_persist_dir: str = "./memory_store"
     ):
         """
         Initialize the SQL generator
@@ -35,6 +42,8 @@ class SmartSQLGenerator:
             model_name: Generative AI model to use
             use_cache: Whether to cache query results
             cache_file: Path to the query cache file
+            use_memory: Whether to use conversation memory
+            memory_persist_dir: Directory to persist memory embeddings
         """
         load_dotenv()
         self.db_analyzer = db_analyzer
@@ -42,6 +51,16 @@ class SmartSQLGenerator:
         self.use_cache = use_cache
         self.cache_file = cache_file
         self.cache = self._load_cache() if use_cache else {}
+        self.use_memory = use_memory
+        
+        # Session-specific memory for tracking conversation context
+        self.session_context = {
+            "user_info": {},
+            "query_sequence": [],
+            "important_values": {},
+            "last_query_result": None,
+            "entity_mentions": {}
+        }
         
         # Initialize the AI model
         api_key = os.getenv("GOOGLE_API_KEY")
@@ -55,24 +74,29 @@ class SmartSQLGenerator:
         self.llm = ChatGoogleGenerativeAI(
             model=model_name,
             temperature=0, 
-            google_api_key=api_key,
-            convert_system_message_to_human=True
+            google_api_key=api_key
         )
         
-        # Define SQL generation prompt
+        # Initialize memory system if enabled
+        self.memory = None
+        if use_memory:
+            self.memory = self._initialize_memory(memory_persist_dir)
+            
+        # Define SQL generation prompt with memory context
+        memory_var = "{memory}\n\n" if use_memory else ""
         self.sql_prompt = PromptTemplate(
-            input_variables=["schema", "question", "examples"],
-            template="""You are an expert SQL developer specializing in PostgreSQL databases. Your job is to translate natural language questions into precise and efficient SQL queries.
+            input_variables=["schema", "question", "examples"] + (["memory"] if use_memory else []),
+            template=f"""You are an expert SQL developer specializing in PostgreSQL databases. Your job is to translate natural language questions into precise and efficient SQL queries.
 
-### DATABASE SCHEMA:
-{schema}
+{memory_var}### DATABASE SCHEMA:
+{{schema}}
 
 ### EXAMPLES OF GOOD SQL PATTERNS:
-{examples}
+{{examples}}
 
 ### TASK:
 Convert the following question into a single PostgreSQL SQL query:
-"{question}"
+"{{question}}"
 
 ### GUIDELINES:
 1. Create only PostgreSQL-compatible SQL
@@ -82,6 +106,11 @@ Convert the following question into a single PostgreSQL SQL query:
 5. Include comments explaining complex parts of your query
 6. Always use proper column quoting with double quotes for columns with spaces or special characters
 7. NEVER use any placeholder values in your final query
+8. Use any available user information (name, role, IDs) from memory to personalize the query if applicable
+9. Use specific values from previous query results when referenced (e.g., "this product", "these customers", "that date")
+10. For follow-up questions or refinements, maintain the filters and conditions from the previous query
+11. If the follow-up question is only changing which columns to display, KEEP ALL WHERE CONDITIONS from the previous query
+12. When user asks for "this" or refers to previous results implicitly, use the context from the previous query
 
 ### OUTPUT FORMAT:
 Provide ONLY the SQL query with no additional text, explanation, or markdown formatting.
@@ -96,19 +125,19 @@ Provide ONLY the SQL query with no additional text, explanation, or markdown for
         
         # Define validation prompt
         self.validation_prompt = PromptTemplate(
-            input_variables=["schema", "sql", "error"],
-            template="""You are an expert SQL developer specializing in PostgreSQL databases. Your job is to fix SQL query errors.
+            input_variables=["schema", "sql", "error"] + (["memory"] if use_memory else []),
+            template=f"""You are an expert SQL developer specializing in PostgreSQL databases. Your job is to fix SQL query errors.
 
-### DATABASE SCHEMA:
-{schema}
+{memory_var}### DATABASE SCHEMA:
+{{schema}}
 
 ### QUERY WITH ERROR:
 ```sql
-{sql}
+{{sql}}
 ```
 
 ### ERROR MESSAGE:
-{error}
+{{error}}
 
 ### TASK:
 Fix the SQL query to resolve the error.
@@ -118,6 +147,7 @@ Fix the SQL query to resolve the error.
 2. Maintain the original query intent
 3. Fix any syntax errors, typos, or invalid column references
 4. NEVER use any placeholder values in your final query
+5. Use any available user information (name, role, IDs) from memory to personalize the query if applicable
 
 ### OUTPUT FORMAT:
 Provide ONLY the corrected SQL query with no additional text, explanation, or markdown formatting.
@@ -133,6 +163,156 @@ Provide ONLY the corrected SQL query with no additional text, explanation, or ma
         # Prepare schema context
         self.schema_context = None
         self.example_patterns = None
+    
+    def _initialize_memory(self, persist_dir: str) -> Optional[BaseMemory]:
+        """Initialize vector store memory with Gemini embeddings"""
+        try:
+            # Ensure the directory exists
+            os.makedirs(persist_dir, exist_ok=True)
+            
+            # Initialize embeddings with the specified model
+            embedding_function = GoogleGenerativeAIEmbeddings(
+                model="models/gemini-embedding-exp-03-07",
+                google_api_key=os.getenv("GOOGLE_API_KEY"),
+            )
+            
+            # Create or load the vector store
+            vectorstore = Chroma(
+                persist_directory=persist_dir,
+                embedding_function=embedding_function,
+                collection_name="sql_conversation_memory"
+            )
+            
+            # Create the retriever
+            retriever = vectorstore.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": 5}
+            )
+            
+            # Create memory
+            memory = VectorStoreRetrieverMemory(
+                retriever=retriever,
+                memory_key="memory",
+                return_docs=True,
+                input_key="question",
+                # Memory types for retriever
+                input_prefix="RETRIEVAL_QUERY: ",
+                document_prefix="RETRIEVAL_DOCUMENT: "
+            )
+            
+            return memory
+        except Exception as e:
+            print(f"Error initializing memory: {e}")
+            return None
+    
+    def _store_in_memory(self, question: str, sql: str, results: Any = None) -> None:
+        """Store the question, generated SQL and results in memory"""
+        if not self.memory or not self.use_memory:
+            return
+            
+        try:
+            # Create document with question and SQL
+            content = f"Question: {question}\nSQL: {sql}"
+            
+            # Extract and store personal information
+            personal_info = self._extract_personal_info(question, results)
+            if personal_info:
+                content = f"{personal_info}\n\n{content}"
+            
+            # Add result summary if available
+            if results:
+                try:
+                    # Count rows or summarize results
+                    if isinstance(results, list) and results:
+                        num_rows = len(results)
+                        sample = results[0] if results else {}
+                        columns = list(sample.keys()) if isinstance(sample, dict) else []
+                        result_summary = f"\nReturned {num_rows} rows with columns: {', '.join(columns)}"
+                        
+                        # Include sample results (first 3 rows at most)
+                        if num_rows > 0:
+                            result_summary += "\nSample results:"
+                            for i, row in enumerate(results[:3]):
+                                result_summary += f"\nRow {i+1}: {str(row)}"
+                        
+                        content += result_summary
+                except Exception as e:
+                    print(f"Error summarizing results: {e}")
+                
+            # Store in memory
+            self.memory.save_context(
+                {"question": question}, 
+                {"memory": content}
+            )
+        except Exception as e:
+            print(f"Error storing in memory: {e}")
+
+    def _extract_personal_info(self, question: str, results: Any = None) -> str:
+        """Extract personal information from user queries or results"""
+        personal_info = []
+        
+        # Check for name information
+        name_patterns = [
+            r"my name is (?P<name>[\w\s]+)",
+            r"I am (?P<name>[\w\s]+)",
+            r"I'm (?P<name>[\w\s]+)",
+            r"call me (?P<name>[\w\s]+)"
+        ]
+        
+        for pattern in name_patterns:
+            match = re.search(pattern, question, re.IGNORECASE)
+            if match:
+                name = match.group("name").strip()
+                personal_info.append(f"User name: {name}")
+                break
+        
+        # Check for other personal identifiers in the question
+        if "my" in question.lower():
+            id_patterns = [
+                r"my (?P<id_type>user|customer|employee|sales|account|order|client|supplier|vendor) (?P<id_value>\w+)",
+                r"my (?P<id_type>user|customer|employee|sales|account|order|client|supplier|vendor) id is (?P<id_value>\w+)",
+                r"my (?P<id_type>user|customer|employee|sales|account|order|client|supplier|vendor) number is (?P<id_value>\w+)",
+            ]
+            
+            for pattern in id_patterns:
+                match = re.search(pattern, question, re.IGNORECASE)
+                if match:
+                    id_type = match.group("id_type").strip()
+                    id_value = match.group("id_value").strip()
+                    personal_info.append(f"User {id_type} ID: {id_value}")
+                    break
+        
+        # Check for personal context "I am a X"
+        role_patterns = [
+            r"I am a (?P<role>[\w\s]+)",
+            r"I'm a (?P<role>[\w\s]+)",
+            r"I work as a (?P<role>[\w\s]+)",
+            r"my role is (?P<role>[\w\s]+)"
+        ]
+        
+        for pattern in role_patterns:
+            match = re.search(pattern, question, re.IGNORECASE)
+            if match:
+                role = match.group("role").strip()
+                personal_info.append(f"User role: {role}")
+                break
+        
+        if personal_info:
+            return "\n".join(personal_info)
+        return ""
+
+    def _get_memory_context(self, question: str) -> str:
+        """Retrieve relevant context from memory for a question"""
+        if not self.memory or not self.use_memory:
+            return ""
+            
+        try:
+            # Get relevant memories
+            memory_context = self.memory.load_memory_variables({"question": question})
+            return memory_context.get("memory", "")
+        except Exception as e:
+            print(f"Error retrieving from memory: {e}")
+            return ""
     
     def _load_cache(self) -> Dict:
         """Load query cache from disk"""
@@ -413,12 +593,20 @@ WHERE (
         question_analysis = self._analyze_question(question)
         
         try:
-            # Generate SQL with LangChain + Gemini
-            response = self.sql_chain.invoke({
+            # Prepare params for SQL generation
+            params = {
                 "schema": self.schema_context,
                 "question": question,
                 "examples": self.example_patterns
-            })
+            }
+            
+            # Add memory if enabled
+            if self.use_memory:
+                memory_context = self._prepare_memory_for_query(question) or ""
+                params["memory"] = memory_context
+                
+            # Generate SQL with LangChain + Gemini
+            response = self.sql_chain.invoke(params)
             
             if isinstance(response, dict) and "text" in response:
                 sql_response = response["text"]
@@ -493,12 +681,20 @@ WHERE (
             # Prepare schema context if not already prepared
             self._prepare_schema_context()
             
-            # Use validation chain to fix the SQL
-            response = self.validation_chain.invoke({
+            # Prepare params for validation chain
+            params = {
                 "schema": self.schema_context,
                 "sql": sql,
                 "error": error
-            })
+            }
+            
+            # Add memory if enabled
+            if self.use_memory:
+                memory_context = self._prepare_memory_for_query(f"Fix SQL error: {error}") or ""
+                params["memory"] = memory_context
+            
+            # Use validation chain to fix the SQL
+            response = self.validation_chain.invoke(params)
             
             if isinstance(response, dict) and "text" in response:
                 fixed_sql = response["text"].strip()
@@ -603,6 +799,14 @@ WHERE (
                 # If fixing failed, break the loop
                 break
         
+        # Store in memory if successful or even if failed (to remember errors too)
+        if self.use_memory:
+            self._store_in_memory(question, sql, results if success else None)
+            
+            # Update session context
+            if success:
+                self._update_session_context(question, sql, results)
+            
         return {
             "success": success,
             "question": question,
@@ -615,6 +819,402 @@ WHERE (
             "execution_time": generation_result.get("execution_time", 0),
             "results": results
         }
+
+    def _update_session_context(self, question: str, sql: str, results: List[Dict]) -> None:
+        """
+        Update session context with the latest query information
+        
+        Args:
+            question: The natural language question
+            sql: The generated SQL query
+            results: The results of the query
+        """
+        if not self.use_memory:
+            return
+            
+        # Extract personal info
+        personal_info = self._extract_personal_info(question)
+        if personal_info:
+            for line in personal_info.split('\n'):
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    self.session_context["user_info"][key.strip()] = value.strip()
+        
+        # Store query in sequence
+        query_entry = {
+            "question": question,
+            "sql": sql,
+            "timestamp": time.time(),
+            "has_results": bool(results) and len(results) > 0
+        }
+        
+        if results and len(results) > 0:
+            # Store summary of results
+            row_count = len(results)
+            sample = results[0]
+            columns = list(sample.keys()) if isinstance(sample, dict) else []
+            
+            query_entry["result_summary"] = {
+                "row_count": row_count,
+                "columns": columns,
+                "sample": results[0] if row_count > 0 else None
+            }
+            
+            # Extract important values from the results
+            important_values = self._extract_important_values(question, sql, results)
+            query_entry["important_values"] = important_values
+            
+            # Update the overall important values
+            self.session_context["important_values"].update(important_values)
+            
+            # Store the last query result
+            self.session_context["last_query_result"] = {
+                "question": question,
+                "sql": sql,
+                "results": results[:10]  # Store up to 10 rows
+            }
+        
+        # Add to query sequence
+        self.session_context["query_sequence"].append(query_entry)
+        if len(self.session_context["query_sequence"]) > 10:
+            # Keep only the last 10 queries
+            self.session_context["query_sequence"] = self.session_context["query_sequence"][-10:]
+    
+    def _extract_important_values(self, question: str, sql: str, results: List[Dict]) -> Dict[str, Any]:
+        """
+        Extract important values from query results that might be referenced in future queries
+        
+        Args:
+            question: The natural language question
+            sql: The SQL query that was executed
+            results: The results of the query
+            
+        Returns:
+            Dictionary of extracted important values
+        """
+        important_values = {}
+        
+        # Extract date values
+        date_columns = set()
+        if results and len(results) > 0:
+            for col, value in results[0].items():
+                # Check if the column might contain date values
+                if any(date_term in col.lower() for date_term in ['date', 'time', 'day', 'month', 'year']):
+                    date_columns.add(col)
+                    
+                    # Store the actual date values
+                    if value is not None:
+                        important_values[f"last_{col.lower().replace(' ', '_')}"] = value
+                        
+                        # For single-value results that are dates, also store special reference names
+                        if len(results) == 1 and len(results[0]) <= 2:
+                            col_lower = col.lower()
+                            if 'first' in col_lower or 'min' in col_lower or 'earliest' in col_lower:
+                                important_values["first_date"] = value
+                                # Keep track of which question produced this value
+                                important_values["first_date_question"] = question
+                            elif 'last' in col_lower or 'max' in col_lower or 'latest' in col_lower:
+                                important_values["last_date"] = value
+                                # Keep track of which question produced this value
+                                important_values["last_date_question"] = question
+                            else:
+                                important_values["the_date"] = value
+        
+        # Extract min/max values that might be referenced
+        aggregation_prefixes = ['min', 'max', 'first', 'last', 'top', 'bottom', 'latest', 'earliest']
+        for col, value in results[0].items() if results else []:
+            col_lower = col.lower()
+            if any(col_lower.startswith(prefix) for prefix in aggregation_prefixes):
+                important_values[col_lower.replace(' ', '_')] = value
+                
+        # Check if the query is finding a specific entity
+        common_queries = {
+            r'SELECT.*MAX\((.*?)date\)': "last_date",
+            r'SELECT.*MIN\((.*?)date\)': "first_date",
+            r'SELECT.*TOP\s+1\s+.*ORDER\s+BY': "specific_entity",
+            r'SELECT.*LIMIT\s+1': "specific_entity"
+        }
+        
+        for pattern, value_type in common_queries.items():
+            if re.search(pattern, sql, re.IGNORECASE) and results and len(results) == 1:
+                # This is likely retrieving a specific value that will be referenced later
+                for col, val in results[0].items():
+                    if value_type == "last_date":
+                        important_values["last_date"] = val
+                        important_values["last_date_question"] = question
+                    elif value_type == "first_date":
+                        important_values["first_date"] = val
+                        important_values["first_date_question"] = question
+                    else:
+                        # For other specific entities, store with column name
+                        important_values[f"{value_type}_{col.lower().replace(' ', '_')}"] = val
+        
+        # Special handling for comparison queries - if we detect a request to compare,
+        # Make sure we track both values being compared
+        comparison_words = ["compare", "versus", "vs", "vs.", "which", "between", "difference", "more", "less", "higher", "lower", "greater", "better", "worse", "top", "bottom"]
+        
+        if any(word in question.lower() for word in comparison_words):
+            important_values["is_comparison_query"] = True
+            
+            # If this is a follow-up to previous queries, link to those important values
+            if "first_date" in self.session_context["important_values"] and "first_date" not in important_values:
+                important_values["first_date"] = self.session_context["important_values"]["first_date"]
+                if "first_date_question" in self.session_context["important_values"]:
+                    important_values["first_date_question"] = self.session_context["important_values"]["first_date_question"]
+                
+            if "last_date" in self.session_context["important_values"] and "last_date" not in important_values:
+                important_values["last_date"] = self.session_context["important_values"]["last_date"]
+                if "last_date_question" in self.session_context["important_values"]:
+                    important_values["last_date_question"] = self.session_context["important_values"]["last_date_question"]
+        
+        return important_values
+
+    def _prepare_session_context_for_query(self, question: str) -> str:
+        """
+        Prepare relevant session context for the current query
+        
+        Args:
+            question: The natural language question
+            
+        Returns:
+            String with formatted session context
+        """
+        if not self.use_memory or not self.session_context:
+            return ""
+        
+        context_parts = []
+        
+        # Add user information
+        if self.session_context["user_info"]:
+            user_info_str = "USER INFORMATION:\n"
+            for key, value in self.session_context["user_info"].items():
+                user_info_str += f"{key}: {value}\n"
+            context_parts.append(user_info_str)
+        
+        # Check for references to previous queries
+        reference_terms = [
+            "this", "that", "these", "those", "it", "they", "them",
+            "previous", "prior", "before", "last", "above", "mentioned",
+            "same", "earlier"
+        ]
+        
+        # Check for comparison terms
+        comparison_terms = [
+            "compare", "versus", "vs", "vs.", "which", "between", "difference", 
+            "more", "less", "higher", "lower", "greater", "better", "worse",
+            "top", "bottom", "each", "both", "two"
+        ]
+        
+        # Check for implicit references or refinement patterns
+        refinement_starters = [
+            "just", "only", "show", "list", "give", "select", "filter",
+            "now", "then", "also", "and", "but"
+        ]
+        
+        implicit_words = ["column", "row", "field", "value", "record", "result", "data"]
+        
+        # Determine if this looks like a refinement or follow-up query
+        is_refinement = False
+        is_reference = any(term in question.lower() for term in reference_terms)
+        is_comparison = any(term in question.lower() for term in comparison_terms)
+        
+        # Check if it starts with a refinement word
+        if any(question.lower().startswith(term) for term in refinement_starters):
+            is_refinement = True
+            
+        # Check for implicit reference patterns (like "just the ids and the date column")
+        if any(word in question.lower() for word in implicit_words):
+            is_refinement = True
+            
+        # Check for very short queries that are likely refinements
+        if len(question.split()) <= 7:
+            is_refinement = True
+        
+        # Always include the last query if it exists
+        if self.session_context["last_query_result"]:
+            last_result = self.session_context["last_query_result"]
+            
+            last_query_str = "PREVIOUS QUERY:\n"
+            last_query_str += f"Question: {last_result['question']}\n"
+            last_query_str += f"SQL: {last_result['sql']}\n"
+            
+            # Extract the conditions from the last SQL query if this looks like a refinement
+            if is_refinement:
+                # Extract WHERE/HAVING/JOIN conditions
+                last_sql = last_result['sql']
+                conditions = self._extract_sql_conditions(last_sql)
+                if conditions:
+                    last_query_str += f"Conditions: {conditions}\n"
+                    
+                # Extract the table names for context
+                tables = self._extract_sql_tables(last_sql)
+                if tables:
+                    last_query_str += f"Tables: {', '.join(tables)}\n"
+            
+            # Include sample results
+            if last_result["results"]:
+                row_count = len(last_result["results"])
+                if row_count == 1:
+                    # For single row results, show the actual values clearly
+                    last_query_str += "Result (single row):\n"
+                    for col, val in last_result["results"][0].items():
+                        last_query_str += f"- {col}: {val}\n"
+                else:
+                    # For multiple rows, summarize
+                    last_query_str += f"Results: {row_count} rows with columns: "
+                    if last_result["results"][0]:
+                        last_query_str += ", ".join(last_result["results"][0].keys())
+                    last_query_str += "\n"
+            
+            context_parts.append(last_query_str)
+        
+        # For refinements or references, add more context about previous queries
+        if is_refinement or is_reference:
+            # Add specific guidance for refinements
+            guidance = "GUIDANCE FOR REFINEMENT:\n"
+            if is_refinement and not is_reference:
+                guidance += "This appears to be a refinement of the previous query. "
+                guidance += "Maintain the same filters and conditions from the previous query, "
+                guidance += "but modify the output columns or presentation according to the new request.\n"
+            context_parts.append(guidance)
+            
+            # Include important values
+            if self.session_context["important_values"]:
+                values_str = "IMPORTANT VALUES FROM PREVIOUS QUERIES:\n"
+                for key, value in self.session_context["important_values"].items():
+                    # Skip metadata keys
+                    if not key.endswith('_question') and not key.startswith('is_'):
+                        values_str += f"{key}: {value}\n"
+                context_parts.append(values_str)
+        
+            # Include more context from earlier queries
+            if len(self.session_context["query_sequence"]) > 1:
+                earlier_queries = self.session_context["query_sequence"][:-1][-2:]  # Get up to 2 earlier queries
+                
+                earlier_str = "EARLIER QUERIES:\n"
+                for idx, query in enumerate(earlier_queries):
+                    earlier_str += f"Query {len(earlier_queries) - idx}:\n"
+                    earlier_str += f"- Question: {query['question']}\n"
+                    earlier_str += f"- SQL: {query['sql']}\n"
+                    
+                    if query.get("important_values"):
+                        important_vals = {k: v for k, v in query["important_values"].items() 
+                                         if not k.endswith('_question') and not k.startswith('is_')}
+                        if important_vals:
+                            earlier_str += "- Important values: "
+                            earlier_str += ", ".join([f"{k}: {v}" for k, v in important_vals.items()])
+                            earlier_str += "\n"
+                
+                context_parts.append(earlier_str)
+                
+        # Special handling for comparison queries
+        if is_comparison:
+            comparison_context = "COMPARISON CONTEXT:\n"
+            
+            # Check if we have cached first_date and last_date
+            first_date = self.session_context["important_values"].get("first_date")
+            last_date = self.session_context["important_values"].get("last_date")
+            
+            if first_date and last_date:
+                comparison_context += f"You are being asked to compare values between these dates:\n"
+                
+                first_date_q = self.session_context["important_values"].get("first_date_question", "")
+                if first_date_q:
+                    comparison_context += f"- First date ({first_date}) was from query: \"{first_date_q}\"\n"
+                else:
+                    comparison_context += f"- First date: {first_date}\n"
+                    
+                last_date_q = self.session_context["important_values"].get("last_date_question", "")
+                if last_date_q:
+                    comparison_context += f"- Last date ({last_date}) was from query: \"{last_date_q}\"\n"
+                else:
+                    comparison_context += f"- Last date: {last_date}\n"
+                    
+                comparison_context += "Make sure to include BOTH dates in your comparison query.\n"
+                context_parts.append(comparison_context)
+            
+        return "\n".join(context_parts)
+        
+    def _extract_sql_conditions(self, sql: str) -> str:
+        """Extract WHERE, HAVING, and JOIN conditions from SQL"""
+        conditions = []
+        
+        # Extract WHERE clause
+        where_match = re.search(r'WHERE\s+(.*?)(?:GROUP BY|ORDER BY|LIMIT|$)', sql, re.IGNORECASE | re.DOTALL)
+        if where_match:
+            conditions.append(f"WHERE {where_match.group(1).strip()}")
+            
+        # Extract HAVING clause
+        having_match = re.search(r'HAVING\s+(.*?)(?:ORDER BY|LIMIT|$)', sql, re.IGNORECASE | re.DOTALL)
+        if having_match:
+            conditions.append(f"HAVING {having_match.group(1).strip()}")
+            
+        # Extract JOIN conditions
+        join_matches = re.finditer(r'(INNER|LEFT|RIGHT|FULL|OUTER)?\s*JOIN\s+(\S+)\s+(?:AS\s+\w+\s+)?ON\s+(.*?)(?=(?:LEFT|RIGHT|INNER|FULL|OUTER)?\s*JOIN|\s+WHERE|\s+GROUP|\s+ORDER|\s+LIMIT|$)', 
+                                 sql, re.IGNORECASE | re.DOTALL)
+        for match in join_matches:
+            join_type = match.group(1) or "JOIN"
+            table = match.group(2)
+            join_condition = match.group(3).strip()
+            conditions.append(f"{join_type} {table} ON {join_condition}")
+            
+        return "; ".join(conditions)
+        
+    def _extract_sql_tables(self, sql: str) -> List[str]:
+        """Extract table names from SQL query"""
+        tables = []
+        
+        # Extract FROM clause
+        from_match = re.search(r'FROM\s+(.*?)(?:WHERE|GROUP BY|ORDER BY|LIMIT|$)', sql, re.IGNORECASE | re.DOTALL)
+        if from_match:
+            # Split by commas and clean up
+            from_tables = from_match.group(1).strip().split(',')
+            for table in from_tables:
+                # Remove aliases and schema prefixes for simplicity
+                table_clean = re.sub(r'(?:AS)?\s+\w+\s*$', '', table.strip(), flags=re.IGNORECASE)
+                tables.append(table_clean.strip())
+                
+        # Extract JOIN tables
+        join_matches = re.finditer(r'JOIN\s+(\S+)', sql, re.IGNORECASE)
+        for match in join_matches:
+            tables.append(match.group(1).strip())
+            
+        return tables
+
+    def _prepare_memory_for_query(self, question: str) -> str:
+        """Prepare memory context specifically for the current query"""
+        memory_context = ""
+        
+        # First get session context (in-memory)
+        session_context = self._prepare_session_context_for_query(question)
+        if session_context:
+            memory_context += session_context + "\n\n"
+        
+        # Then add vector store memory if available
+        if self.memory and self.use_memory:
+            try:
+                # Get relevant memories
+                vector_memory = self._get_memory_context(question)
+                
+                if vector_memory:
+                    # Extract user information patterns
+                    user_info = []
+                    for line in vector_memory.split('\n'):
+                        if line.startswith('User '):
+                            user_info.append(line)
+                    
+                    # Add vector memory without duplicating user info already in session context
+                    if session_context and user_info:
+                        # Remove the user info from vector memory to avoid duplication
+                        memory_lines = [line for line in vector_memory.split('\n') if not line.startswith('User ')]
+                        filtered_memory = "\n".join(memory_lines)
+                        memory_context += "PERSISTENT MEMORY:\n" + filtered_memory
+                    else:
+                        memory_context += vector_memory
+            except Exception as e:
+                print(f"Error preparing vector memory for query: {e}")
+        
+        return memory_context
 
 
 if __name__ == "__main__":
@@ -634,7 +1234,11 @@ if __name__ == "__main__":
     db_analyzer = DatabaseAnalyzer(db_name, username, password, host, port)
     
     # Initialize SQL generator
-    sql_generator = SmartSQLGenerator(db_analyzer)
+    sql_generator = SmartSQLGenerator(
+        db_analyzer,
+        use_memory=True,
+        memory_persist_dir="./memory_store"
+    )
     
     # Test with a sample question
     question = "Show me the top 5 customers by total order amount"
