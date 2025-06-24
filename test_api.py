@@ -124,7 +124,7 @@ def test_analysis_query(session_id, query):
             print(f"\nTable {i+1}: {table.get('name', 'Unnamed Query')}")
             print(f"Description: {table.get('description', 'No description')}")
             print(f"SQL: {table.get('sql', 'No SQL')}")
-            
+
             # Format results
             if table.get("results") and len(table["results"]) > 0:
                 print(f"Results: (showing {min(3, len(table['results']))} of {len(table['results'])} rows)")
@@ -164,7 +164,7 @@ def test_pagination(session_id, query):
     response = requests.post(url, json=payload)
     print(f"\n=== Pagination Test: '{query}' ===")
     print(f"Status Code: {response.status_code}")
-    
+
     # Format the results for readability
     result = response.json()
     
@@ -179,7 +179,7 @@ def test_pagination(session_id, query):
         print(f"Table ID: {table_id}")
         print(f"Total pages: {total_pages}")
         print(f"First page results: {len(result['results'])} rows")
-        
+
         # Print first page results
         for i, row in enumerate(result["results"]):
             print(f"  Row {i+1}: {json.dumps(row, indent=2)}")

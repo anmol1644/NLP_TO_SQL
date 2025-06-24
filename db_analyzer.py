@@ -3,6 +3,11 @@ import pandas as pd
 from sqlalchemy import create_engine, inspect, MetaData, text
 from sqlalchemy.ext.automap import automap_base
 from typing import Dict, List, Any, Tuple, Optional
+import psycopg2
+import warnings
+
+# Suppress SQLAlchemy warnings for unrecognized column types
+warnings.filterwarnings("ignore", "Did not recognize type", module="sqlalchemy")
 
 
 class DatabaseAnalyzer:
@@ -17,7 +22,9 @@ class DatabaseAnalyzer:
         username: str,
         password: str,
         host: str = "localhost",
-        port: str = "5432"
+        port: str = "5432",
+        connection_manager=None,
+        workspace_id: str = None
     ):
         """
         Initialize the database analyzer
@@ -28,13 +35,37 @@ class DatabaseAnalyzer:
             password: PostgreSQL password
             host: PostgreSQL host
             port: PostgreSQL port
+            connection_manager: Optional connection manager instance
+            workspace_id: Workspace ID for connection pooling
         """
         self.db_name = db_name
+        self.username = username
+        self.password = password
+        self.host = host
+        self.port = port
         self.connection_string = f"postgresql://{username}:{password}@{host}:{port}/{db_name}"
         self.engine = create_engine(self.connection_string)
         self.metadata = MetaData()
         self.inspector = inspect(self.engine)
         self.schema_info = None
+        
+        # Connection pooling support
+        self.connection_manager = connection_manager
+        self.workspace_id = workspace_id
+        
+    def get_connection(self):
+        """Get a database connection, either from pool or direct"""
+        if self.connection_manager and self.workspace_id:
+            return self.connection_manager.get_connection(self.workspace_id)
+        else:
+            # Fallback to direct connection
+            return psycopg2.connect(
+                host=self.host,
+                port=self.port,
+                database=self.db_name,
+                user=self.username,
+                password=self.password
+            )
         
     def analyze_schema(self) -> Dict[str, Any]:
         """
@@ -428,26 +459,57 @@ class DatabaseAnalyzer:
             Tuple of (success, results, error_message)
         """
         try:
-            with self.engine.connect() as connection:
-                result = connection.execute(text(query))
-                
-                if result.returns_rows:
-                    # Convert result to a list of dictionaries
-                    columns = result.keys()
-                    data = []
-                    for row in result:
-                        row_dict = {}
-                        for idx, column in enumerate(columns):
-                            value = row[idx]
-                            # Convert non-serializable types to strings for JSON compatibility
-                            if isinstance(value, (pd.Timestamp, pd.Timedelta)):
-                                value = str(value)
-                            row_dict[column] = value
-                        data.append(row_dict)
+            # Use connection pool if available, otherwise fall back to engine
+            if self.connection_manager and self.workspace_id:
+                with self.connection_manager.get_connection(self.workspace_id) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(query)
                     
-                    return True, data, None
-                else:
-                    return True, [], None
+                    # Check if query returns rows
+                    if cursor.description:
+                        # Get column names
+                        columns = [desc[0] for desc in cursor.description]
+                        rows = cursor.fetchall()
+                        
+                        # Convert to list of dictionaries
+                        data = []
+                        for row in rows:
+                            row_dict = {}
+                            for idx, column in enumerate(columns):
+                                value = row[idx]
+                                # Convert non-serializable types to strings for JSON compatibility
+                                if isinstance(value, (pd.Timestamp, pd.Timedelta)):
+                                    value = str(value)
+                                row_dict[column] = value
+                            data.append(row_dict)
+                        
+                        cursor.close()
+                        return True, data, None
+                    else:
+                        cursor.close()
+                        return True, [], None
+            else:
+                # Fallback to SQLAlchemy engine
+                with self.engine.connect() as connection:
+                    result = connection.execute(text(query))
+                    
+                    if result.returns_rows:
+                        # Convert result to a list of dictionaries
+                        columns = result.keys()
+                        data = []
+                        for row in result:
+                            row_dict = {}
+                            for idx, column in enumerate(columns):
+                                value = row[idx]
+                                # Convert non-serializable types to strings for JSON compatibility
+                                if isinstance(value, (pd.Timestamp, pd.Timedelta)):
+                                    value = str(value)
+                                row_dict[column] = value
+                            data.append(row_dict)
+                        
+                        return True, data, None
+                    else:
+                        return True, [], None
                 
         except Exception as e:
             return False, None, str(e)

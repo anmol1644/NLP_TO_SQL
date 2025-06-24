@@ -10,12 +10,13 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains import LLMChain
+from langchain_core.runnables import RunnableSequence
 from langchain.prompts import PromptTemplate
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain.memory import VectorStoreRetrieverMemory
 from langchain.schema.memory import BaseMemory
+from langchain.schema import BaseRetriever
 
 from db_analyzer import DatabaseAnalyzer
 
@@ -128,11 +129,8 @@ Provide ONLY the SQL query with no additional text, explanation, or markdown for
 """
         )
         
-        # Create the SQL generation chain
-        self.sql_chain = LLMChain(
-            llm=self.llm,
-            prompt=self.sql_prompt
-        )
+        # Create the SQL generation chain using RunnableSequence
+        self.sql_chain = self.sql_prompt | self.llm
         
         # Define validation prompt
         self.validation_prompt = PromptTemplate(
@@ -165,11 +163,8 @@ Provide ONLY the corrected SQL query with no additional text, explanation, or ma
 """
         )
         
-        # Create the validation chain
-        self.validation_chain = LLMChain(
-            llm=self.llm,
-            prompt=self.validation_prompt
-        )
+        # Create the validation chain using RunnableSequence
+        self.validation_chain = self.validation_prompt | self.llm
 
         # Define text response prompt
         self.text_response_prompt = PromptTemplate(
@@ -217,11 +212,8 @@ Provide a natural language response that directly answers the user's question. B
 """
         )
         
-        # Create the text response chain
-        self.text_response_chain = LLMChain(
-            llm=self.llm,
-            prompt=self.text_response_prompt
-        )
+        # Create the text response chain using RunnableSequence
+        self.text_response_chain = self.text_response_prompt | self.llm
 
         # Define conversation prompt for non-SQL conversations
         self.conversation_prompt = PromptTemplate(
@@ -255,11 +247,8 @@ Provide a natural language response that directly answers the user's question. B
 """
         )
         
-        # Create the conversation chain
-        self.conversation_chain = LLMChain(
-            llm=self.llm,
-            prompt=self.conversation_prompt
-        )
+        # Create the conversation chain using RunnableSequence
+        self.conversation_chain = self.conversation_prompt | self.llm
 
         # Define multi-query analysis prompt
         self.analysis_prompt = PromptTemplate(
@@ -296,11 +285,8 @@ Provide a thorough analysis of the data that directly answers the user's questio
 """
         )
         
-        # Create the analysis chain
-        self.analysis_chain = LLMChain(
-            llm=self.llm,
-            prompt=self.analysis_prompt
-        )
+        # Create the analysis chain using RunnableSequence
+        self.analysis_chain = self.analysis_prompt | self.llm
 
         # Define query planning prompt for complex questions
         self.query_planner_prompt = PromptTemplate(
@@ -335,11 +321,8 @@ ANALYSIS_APPROACH: [brief description of how these queries will help answer the 
 """
         )
         
-        # Create the query planner chain
-        self.query_planner_chain = LLMChain(
-            llm=self.llm,
-            prompt=self.query_planner_prompt
-        )
+        # Create the query planner chain using RunnableSequence
+        self.query_planner_chain = self.query_planner_prompt | self.llm
         
         # Prepare schema context
         self.schema_context = None
@@ -370,17 +353,42 @@ ANALYSIS_APPROACH: [brief description of how these queries will help answer the 
                 search_kwargs={"k": 5}
             )
             
-            # Create memory
-            memory = VectorStoreRetrieverMemory(
-                retriever=retriever,
-                memory_key="memory",
-                return_docs=True,
-                input_key="question",
-                # Memory types for retriever
-                input_prefix="RETRIEVAL_QUERY: ",
-                document_prefix="RETRIEVAL_DOCUMENT: "
-            )
+            # Create custom memory class
+            class CustomVectorMemory(BaseMemory):
+                def __init__(self, retriever):
+                    self.retriever = retriever
+                    self.memory_key = "memory"
+                    
+                @property
+                def memory_variables(self) -> List[str]:
+                    return [self.memory_key]
+                
+                def load_memory_variables(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+                    query = inputs.get("question", "")
+                    if query:
+                        try:
+                            docs = self.retriever.get_relevant_documents(query)
+                            memory_content = "\n".join([doc.page_content for doc in docs])
+                            return {self.memory_key: memory_content}
+                        except Exception as e:
+                            print(f"Error loading memory: {e}")
+                            return {self.memory_key: ""}
+                    return {self.memory_key: ""}
+                
+                def save_context(self, inputs: Dict[str, Any], outputs: Dict[str, str]) -> None:
+                    try:
+                        content = outputs.get("memory", "")
+                        if content:
+                            doc = Document(page_content=content)
+                            self.retriever.vectorstore.add_documents([doc])
+                    except Exception as e:
+                        print(f"Error saving to memory: {e}")
+                
+                def clear(self) -> None:
+                    # Clear method - not implemented for vector store
+                    pass
             
+            memory = CustomVectorMemory(retriever)
             return memory
         except Exception as e:
             print(f"Error initializing memory: {e}")
@@ -482,6 +490,17 @@ ANALYSIS_APPROACH: [brief description of how these queries will help answer the 
             return "\n".join(personal_info)
         return ""
 
+    def _extract_response_content(self, response) -> str:
+        """Extract content from LangChain response in a consistent way"""
+        if hasattr(response, 'content'):
+            return response.content
+        elif isinstance(response, dict) and "text" in response:
+            return response["text"]
+        elif isinstance(response, str):
+            return response
+        else:
+            return str(response)
+    
     def _get_memory_context(self, question: str) -> str:
         """Retrieve relevant context from memory for a question"""
         if not self.memory or not self.use_memory:
@@ -490,7 +509,24 @@ ANALYSIS_APPROACH: [brief description of how these queries will help answer the 
         try:
             # Get relevant memories
             memory_context = self.memory.load_memory_variables({"question": question})
-            return memory_context.get("memory", "")
+            memory_data = memory_context.get("memory", "")
+            
+            # Ensure we return a string
+            if isinstance(memory_data, list):
+                # If it's a list of documents, join their content
+                memory_strings = []
+                for doc in memory_data:
+                    if hasattr(doc, 'page_content'):
+                        memory_strings.append(doc.page_content)
+                    elif isinstance(doc, str):
+                        memory_strings.append(doc)
+                    else:
+                        memory_strings.append(str(doc))
+                return "\n".join(memory_strings)
+            elif isinstance(memory_data, str):
+                return memory_data
+            else:
+                return str(memory_data)
         except Exception as e:
             print(f"Error retrieving from memory: {e}")
             return ""
@@ -789,17 +825,7 @@ WHERE (
             # Generate SQL with LangChain + Gemini
             response = self.sql_chain.invoke(params)
             
-            if isinstance(response, dict) and "text" in response:
-                sql_response = response["text"]
-            else:
-                return {
-                    "success": False,
-                    "sql": None,
-                    "source": "ai",
-                    "confidence": 0,
-                    "error": "AI returned an unexpected response format",
-                    "execution_time": time.time() - start_time
-                }
+            sql_response = self._extract_response_content(response)
             
             # Clean up response to extract just the SQL
             sql = sql_response.strip()
@@ -877,18 +903,7 @@ WHERE (
             # Use validation chain to fix the SQL
             response = self.validation_chain.invoke(params)
             
-            if isinstance(response, dict) and "text" in response:
-                fixed_sql = response["text"].strip()
-            else:
-                return {
-                    "success": False,
-                    "sql": sql,
-                    "fixed_sql": None,
-                    "source": "ai",
-                    "confidence": 0,
-                    "error": "AI returned an unexpected response format",
-                    "execution_time": time.time() - start_time
-                }
+            fixed_sql = self._extract_response_content(response).strip()
             
             # Clean up response
             if fixed_sql.startswith('```') and fixed_sql.endswith('```'):
@@ -984,14 +999,7 @@ WHERE (
                 # Generate conversational response
                 response = self.conversation_chain.invoke(params)
             
-            if isinstance(response, dict) and "text" in response:
-                text_response = response["text"].strip()
-            else:
-                return {
-                    "success": False,
-                    "text": "Unable to generate a response.",
-                    "generation_time": time.time() - start_time
-                }
+            text_response = self._extract_response_content(response).strip()
             
             # Store in session context for future reference
             if self.session_context:
@@ -1344,10 +1352,7 @@ Provide a thorough analysis that directly answers why the observed trend is happ
         )
         
         # Create a temporary chain for the causal analysis
-        causal_chain = LLMChain(
-            llm=self.llm,
-            prompt=causal_analysis_prompt
-        )
+        causal_chain = causal_analysis_prompt | self.llm
         
         # Prepare params for analysis
         params = {
@@ -1364,12 +1369,8 @@ Provide a thorough analysis that directly answers why the observed trend is happ
         # Generate the causal analysis
         analysis_response = causal_chain.invoke(params)
         
-        if isinstance(analysis_response, dict) and "text" in analysis_response:
-            analysis_text = analysis_response["text"].strip()
-            print("Causal analysis generated successfully")
-        else:
-            analysis_text = "Unable to generate causal analysis from the query results."
-            print("Failed to generate causal analysis")
+        analysis_text = self._extract_response_content(analysis_response).strip()
+        print("Causal analysis generated successfully")
         
         # Step 5: Store in memory and session context
         if self.use_memory:
@@ -1547,56 +1548,55 @@ Provide a thorough analysis that directly answers why the observed trend is happ
             # Generate query plan
             response = self.query_planner_chain.invoke(params)
             
-            if isinstance(response, dict) and "text" in response:
-                response_text = response["text"].strip()
+            response_text = self._extract_response_content(response).strip()
                 
-                # Parse the simple key-value format
-                needs_multiple = False
-                num_queries = 1
-                query_plan = []
-                analysis_approach = "Direct query approach"
-                
-                # Extract information using regex patterns
-                needs_multiple_match = re.search(r'NEEDS_MULTIPLE_QUERIES:\s*(yes|no|true|false)', response_text, re.IGNORECASE)
-                if needs_multiple_match:
-                    value = needs_multiple_match.group(1).lower()
-                    needs_multiple = value == "yes" or value == "true"
-                
-                num_queries_match = re.search(r'NUMBER_OF_QUERIES_NEEDED:\s*(\d+)', response_text, re.IGNORECASE)
-                if num_queries_match:
-                    try:
-                        num_queries = int(num_queries_match.group(1))
-                    except ValueError:
-                        num_queries = 1
-                
-                # Extract query descriptions
-                query_matches = re.findall(r'-\s*Query\s+\d+:\s*(.+?)(?=\n-|\nANALYSIS_APPROACH:|$)', response_text, re.DOTALL)
-                if query_matches:
-                    for i, description in enumerate(query_matches):
-                        query_plan.append({
-                            "query_name": f"Query {i+1}",
-                            "description": description.strip(),
-                            "time_period": "not specified",
-                            "key_metrics": []
-                        })
-                else:
-                    # Fallback to default query plan
-                    query_plan = default_plan["query_plan"]
-                
-                # Extract analysis approach
-                analysis_match = re.search(r'ANALYSIS_APPROACH:\s*(.+?)$', response_text, re.DOTALL)
-                if analysis_match:
-                    analysis_approach = analysis_match.group(1).strip()
-                
-                # Build the final query plan
-                result = {
-                    "is_multi_query": needs_multiple and num_queries > 1,
-                    "query_plan": query_plan,
-                    "analysis_approach": analysis_approach
-                }
-                
-                print("Query plan generated successfully")
-                return result
+            # Parse the simple key-value format
+            needs_multiple = False
+            num_queries = 1
+            query_plan = []
+            analysis_approach = "Direct query approach"
+            
+            # Extract information using regex patterns
+            needs_multiple_match = re.search(r'NEEDS_MULTIPLE_QUERIES:\s*(yes|no|true|false)', response_text, re.IGNORECASE)
+            if needs_multiple_match:
+                value = needs_multiple_match.group(1).lower()
+                needs_multiple = value == "yes" or value == "true"
+            
+            num_queries_match = re.search(r'NUMBER_OF_QUERIES_NEEDED:\s*(\d+)', response_text, re.IGNORECASE)
+            if num_queries_match:
+                try:
+                    num_queries = int(num_queries_match.group(1))
+                except ValueError:
+                    num_queries = 1
+            
+            # Extract query descriptions
+            query_matches = re.findall(r'-\s*Query\s+\d+:\s*(.+?)(?=\n-|\nANALYSIS_APPROACH:|$)', response_text, re.DOTALL)
+            if query_matches:
+                for i, description in enumerate(query_matches):
+                    query_plan.append({
+                        "query_name": f"Query {i+1}",
+                        "description": description.strip(),
+                        "time_period": "not specified",
+                        "key_metrics": []
+                    })
+            else:
+                # Fallback to default query plan
+                query_plan = default_plan["query_plan"]
+            
+            # Extract analysis approach
+            analysis_match = re.search(r'ANALYSIS_APPROACH:\s*(.+?)$', response_text, re.DOTALL)
+            if analysis_match:
+                analysis_approach = analysis_match.group(1).strip()
+            
+            # Build the final query plan
+            result = {
+                "is_multi_query": needs_multiple and num_queries > 1,
+                "query_plan": query_plan,
+                "analysis_approach": analysis_approach
+            }
+            
+            print("Query plan generated successfully")
+            return result
             
             print("No valid text in response, using default plan")
             return default_plan
@@ -1771,12 +1771,8 @@ Provide a thorough analysis that directly answers why the observed trend is happ
         # Generate the analysis
         analysis_response = self.analysis_chain.invoke(params)
         
-        if isinstance(analysis_response, dict) and "text" in analysis_response:
-            analysis_text = analysis_response["text"].strip()
-            print("Analysis generated successfully")
-        else:
-            analysis_text = "Unable to generate analysis from the query results."
-            print("Failed to generate analysis")
+        analysis_text = self._extract_response_content(analysis_response).strip()
+        print("Analysis generated successfully")
         
         # Step 4: Store in memory and session context
         if self.use_memory:
@@ -2370,6 +2366,10 @@ Provide a thorough analysis that directly answers why the observed trend is happ
                 vector_memory = self._get_memory_context(question)
                 
                 if vector_memory:
+                    # Ensure vector_memory is a string
+                    if not isinstance(vector_memory, str):
+                        vector_memory = str(vector_memory)
+                    
                     # Extract user information patterns
                     user_info = []
                     for line in vector_memory.split('\n'):
@@ -2493,10 +2493,7 @@ CONVERSATIONAL - if the question is asking for information, explanation, or conv
         )
         
         # Create a temporary chain for classification
-        conversation_classifier_chain = LLMChain(
-            llm=self.llm,
-            prompt=conversation_classifier_prompt
-        )
+        conversation_classifier_chain = conversation_classifier_prompt | self.llm
         
         try:
             # Prepare params for classification
@@ -2508,16 +2505,15 @@ CONVERSATIONAL - if the question is asking for information, explanation, or conv
             # Generate classification
             response = conversation_classifier_chain.invoke(params)
             
-            if isinstance(response, dict) and "text" in response:
-                classification = response["text"].strip().upper()
-                
-                # Check for conversational classification
-                if "CONVERSATIONAL" in classification:
-                    print(f"LLM classified question as conversational: {question}")
-                    return True
-                else:
-                    print(f"LLM classified question as requiring SQL: {question}")
-                    return False
+            classification = self._extract_response_content(response).strip().upper()
+            
+            # Check for conversational classification
+            if "CONVERSATIONAL" in classification:
+                print(f"LLM classified question as conversational: {question}")
+                return True
+            else:
+                print(f"LLM classified question as requiring SQL: {question}")
+                return False
             
             # Default to the keyword-based approach if LLM classification fails
             print("LLM classification failed, falling back to keyword-based approach")

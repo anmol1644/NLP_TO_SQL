@@ -1,123 +1,122 @@
-# Natural Language to SQL Query System
+# NLP to SQL System
 
-A Python application that dynamically analyzes any PostgreSQL database schema and converts natural language business questions into SQL queries using AI.
+A powerful natural language to SQL conversion system with multi-user support, workspace management, and persistent conversation history.
+
+## Overview
+
+This system allows users to interact with databases using natural language. It converts natural language questions into SQL queries, executes them, and returns the results along with natural language explanations. The system supports multiple users, each with their own workspaces connected to different databases, and maintains conversation history for context-aware responses.
 
 ## Features
 
-- **Dynamic Database Analysis**: Automatically discovers and analyzes any PostgreSQL database schema
-- **AI-Powered SQL Generation**: Uses Google Gemini to convert natural language to precise SQL
-- **No Predefined Templates**: Works with any database structure without requiring pre-configured templates
-- **Schema Exploration**: Analyzes tables, columns, relationships, and data distributions
-- **Auto-Fix Capability**: Automatically attempts to fix SQL errors when they occur
-- **Interactive Mode**: Ask natural language questions and view query results immediately
-- **Demo Mode**: Runs example queries to showcase capabilities
-- **Query Statistics**: Provides confidence scores and execution metrics
+- **Natural Language to SQL**: Convert natural language questions into SQL queries
+- **Multi-user Authentication**: JWT-based authentication system
+- **Workspace Management**: Each user can create multiple workspaces connected to different databases
+- **Session Management**: Each workspace can have multiple chat sessions (conversations)
+- **Persistent Context**: Conversation history is stored in a vector database for context-aware responses
+- **Pagination**: Large result sets are paginated for better performance
+- **MongoDB Integration**: User data, workspaces, and sessions are stored in MongoDB
+- **Vector Database**: Conversation context is stored in a vector database for semantic search
+- **Intelligent Query Analysis**: 
+  - Handles conversational queries without SQL
+  - Detects and processes "why" questions with causal analysis
+  - Supports multi-query analysis for complex questions
+  - Handles pagination for large result sets
 
-## Requirements
+## Architecture
+
+The system consists of two main components:
+
+1. **Backend API**: A FastAPI application that handles:
+   - User authentication
+   - Workspace and session management
+   - Natural language to SQL conversion
+   - Database querying
+   - Context management
+
+2. **Frontend Application**: A Next.js application that provides:
+   - User registration and login
+   - Workspace and session management
+   - Chat interface for natural language queries
+   - SQL and results display
+   - Pagination for large result sets
+
+## Setup
+
+### Prerequisites
 
 - Python 3.8+
-- PostgreSQL database
-- Google Gemini API key
-- Dependencies listed in `requirements.txt`
+- MongoDB 4.4+
+- PostgreSQL (for the target databases)
+- Node.js 16+ (for frontend)
 
-## Installation
+### Backend Setup
 
-1. Clone the repository:
-
-```bash
-git clone https://github.com/yourusername/nlp-to-sql.git
-cd nlp-to-sql
-```
-
-2. Install the required dependencies:
+1. Clone the repository
+2. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Set up environment variables:
+3. Create a `.env` file with the required environment variables (see BACKEND_README.md)
+4. Start the server:
 
-Create a `.env` file in the project root with the following variables:
-
+```bash
+uvicorn api:app --reload
 ```
-# Google Gemini API Key
-GOOGLE_API_KEY=your_gemini_api_key_here
 
-# PostgreSQL Database Connection (optional, can be entered interactively)
-DB_NAME=your_database_name
-DB_USERNAME=your_database_username
-DB_PASSWORD=your_database_password
-DB_HOST=localhost
-DB_PORT=5432
+For more details, see [BACKEND_README.md](BACKEND_README.md).
 
-# Optional Gemini model selection (defaults to gemini-2.0-flash)
-GEMINI_MODEL=gemini-2.0-flash
+### Frontend Setup
+
+1. Navigate to the frontend directory:
+
+```bash
+cd nlp-sql-chatbot
 ```
+
+2. Install dependencies:
+
+```bash
+npm install
+```
+
+3. Create a `.env.local` file with the required environment variables (see FRONTEND_README.md)
+4. Start the development server:
+
+```bash
+npm run dev
+```
+
+For more details, see [FRONTEND_README.md](FRONTEND_README.md).
 
 ## Usage
 
-Run the main application:
+1. Register a new user account
+2. Create a workspace connected to your database
+3. Create a session within the workspace
+4. Start asking questions in natural language
+5. View the generated SQL, results, and explanations
 
-```bash
-python main.py
-```
+## API Documentation
 
-The application will:
-1. Connect to your PostgreSQL database
-2. Automatically analyze and understand the database schema
-3. Provide options for interactive natural language queries or demo mode
+The API documentation is available at `/docs` when the backend server is running.
 
-### Interactive Mode
+## Security Considerations
 
-In interactive mode, you can:
-- Type natural language questions about your data
-- View the generated SQL queries
-- See the query results with formatting options
-- Export query results to CSV files
-
-Example questions:
-- "Show me the top 10 customers by total order value"
-- "What's the average sales per month over the last year?"
-- "Which product categories have the highest profit margins?"
-- "List all customers who haven't made a purchase in the last 6 months"
-
-### Demo Mode
-
-The demo mode runs a set of predefined queries to showcase the system's capabilities with your specific database. This is useful for exploring what kinds of questions the system can answer.
-
-## How It Works
-
-The system works in several steps:
-
-1. **Database Analysis**: Connects to your PostgreSQL database and analyzes:
-   - Table and column structures
-   - Primary and foreign key relationships
-   - Data distributions and statistics
-   - Sample data patterns
-
-2. **Schema Understanding**: Builds a comprehensive understanding of the database schema that the AI can use as context.
-
-3. **Query Generation**: When you ask a question:
-   - The system provides the AI with database context and your question
-   - The AI generates a PostgreSQL-compatible SQL query
-   - The system validates the query for safety and syntax
-
-4. **Query Execution**: Executes the SQL against your database and returns the results.
-
-5. **Error Handling**: If errors occur, the system can automatically attempt to fix the SQL and try again.
-
-## Project Structure
-
-- `main.py` - Main application entry point
-- `db_analyzer.py` - Database schema analyzer
-- `smart_sql.py` - AI-powered SQL generation engine
-
-## Limitations
-
-- The system is designed for SELECT queries only (no data modification)
-- Complex analytical questions may require refinement
-- Performance depends on database size and query complexity
+- Database passwords are stored in MongoDB. In a production environment, consider encrypting these passwords.
+- JWT tokens have a 24-hour expiration by default. Adjust this as needed for your security requirements.
+- The API uses CORS with "*" as the allowed origin. In production, specify your frontend domains.
 
 ## License
 
-[MIT License](LICENSE) 
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Acknowledgments
+
+- [FastAPI](https://fastapi.tiangolo.com/)
+- [Next.js](https://nextjs.org/)
+- [Google Generative AI](https://ai.google.dev/)
+- [LangChain](https://langchain.com/)
+- [MongoDB](https://www.mongodb.com/)
+- [Chroma DB](https://www.trychroma.com/) 
