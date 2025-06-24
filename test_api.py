@@ -1,82 +1,239 @@
-import json
+import os
 import requests
+import json
+from dotenv import load_dotenv
+import pandas as pd
 
-# API URL - change as needed
-BASE_URL = "http://localhost:8000"
+# Load environment variables
+load_dotenv()
 
-def print_json(data):
-    """Pretty print JSON data"""
-    print(json.dumps(data, indent=2))
+# API endpoint
+API_BASE_URL = "http://localhost:8000"
 
-def test_api():
-    """Test the NLP to SQL API"""
-    print("Testing NLP to SQL API...")
-
-    # Check if API is running
-    print("\n1. Checking API status...")
-    response = requests.get(f"{BASE_URL}/")
-    print_json(response.json())
-
-    # Create a new session
-    print("\n2. Creating a new session...")
-    session_data = {
-        "db_name": "Adventureworks",  # Change to match your database
-        "username": "postgres",
-        "password": "akshwalia", 
+def test_create_session():
+    """Test creating a new session"""
+    url = f"{API_BASE_URL}/sessions"
+    
+    # Database connection details
+    payload = {
+        "db_name": os.getenv("DB_NAME"),
+        "username": os.getenv("DB_USERNAME"),
+        "password": os.getenv("DB_PASSWORD"),
+        "host": os.getenv("DB_HOST", "localhost"),
+        "port": os.getenv("DB_PORT", "5432"),
         "use_memory": True,
         "use_cache": True
     }
-    response = requests.post(f"{BASE_URL}/sessions", json=session_data)
+    
+    response = requests.post(url, json=payload)
+    print("\n=== Creating Session ===")
+    print(f"Status Code: {response.status_code}")
+    print(f"Response: {json.dumps(response.json(), indent=2)}")
     
     if response.status_code == 201:
-        session_result = response.json()
-        print_json(session_result)
-        session_id = session_result["session_id"]
+        return response.json()["session_id"]
     else:
-        print(f"Failed to create session: {response.status_code}")
-        print_json(response.json())
-        return
+        return None
 
-    # Get session info
-    print(f"\n3. Getting session info for {session_id}...")
-    response = requests.get(f"{BASE_URL}/sessions/{session_id}")
-    print_json(response.json())
+def test_sql_query(session_id, query):
+    """Test executing a regular SQL query"""
+    url = f"{API_BASE_URL}/sessions/{session_id}/query"
+    
+    # Query details
+    payload = {
+        "question": query,
+        "auto_fix": True,
+        "max_attempts": 2
+    }
+    
+    response = requests.post(url, json=payload)
+    print(f"\n=== SQL Query: '{query}' ===")
+    print(f"Status Code: {response.status_code}")
+    
+    # Format the results for readability
+    result = response.json()
+    
+    # Print SQL and text response
+    print(f"SQL: {result.get('sql')}")
+    print(f"Text Response: {result.get('text', 'No text response')}")
+    
+    # Format and print results if available
+    if result.get("results") and len(result["results"]) > 0:
+        print(f"Results: (showing {min(3, len(result['results']))} of {len(result['results'])} rows)")
+        for i, row in enumerate(result["results"][:3]):
+            print(f"  Row {i+1}: {json.dumps(row, indent=2)}")
+    else:
+        print("No results or empty result set")
+    
+    return result
 
-    # Make a query within session
-    print("\n4. Making a query with session...")
-    query_data = {
-        "question": "Show me the last 5 sales",
+def test_conversational_query(session_id, query):
+    """Test executing a conversational query that returns only text"""
+    url = f"{API_BASE_URL}/sessions/{session_id}/query"
+    
+    # Query details
+    payload = {
+        "question": query,
+    }
+    
+    response = requests.post(url, json=payload)
+    print(f"\n=== Conversational Query: '{query}' ===")
+    print(f"Status Code: {response.status_code}")
+    
+    # Format the results for readability
+    result = response.json()
+    
+    # Print text response and check if it's a conversational query
+    print(f"Is Conversational: {result.get('is_conversational', False)}")
+    print(f"Text Response: {result.get('text', 'No text response')}")
+    
+    return result
+
+def test_analysis_query(session_id, query):
+    """Test executing an analysis query that might require multiple queries"""
+    url = f"{API_BASE_URL}/sessions/{session_id}/query"
+    
+    # Query details
+    payload = {
+        "question": query,
         "auto_fix": True
     }
-    response = requests.post(f"{BASE_URL}/sessions/{session_id}/query", json=query_data)
-    print_json(response.json())
+    
+    response = requests.post(url, json=payload)
+    print(f"\n=== Analysis Query: '{query}' ===")
+    print(f"Status Code: {response.status_code}")
+    
+    # Format the results for readability
+    result = response.json()
+    
+    # Check query type and analysis type
+    query_type = result.get("query_type", "standard")
+    analysis_type = result.get("analysis_type", "")
+    is_multi_query = result.get("is_multi_query", False)
+    
+    print(f"Query Type: {query_type}")
+    if analysis_type:
+        print(f"Analysis Type: {analysis_type}")
+    print(f"Is Multi-Query Analysis: {is_multi_query}")
+    
+    # Check if this is a multi-query or causal (why) analysis
+    if (query_type == "analysis" and "tables" in result):
+        # Print all tables with headers
+        print("\nMultiple tables returned:")
+        for i, table in enumerate(result["tables"]):
+            print(f"\nTable {i+1}: {table.get('name', 'Unnamed Query')}")
+            print(f"Description: {table.get('description', 'No description')}")
+            print(f"SQL: {table.get('sql', 'No SQL')}")
+            
+            # Format results
+            if table.get("results") and len(table["results"]) > 0:
+                print(f"Results: (showing {min(3, len(table['results']))} of {len(table['results'])} rows)")
+                for j, row in enumerate(table["results"][:3]):
+                    print(f"  Row {j+1}: {json.dumps(row, indent=2)}")
+            else:
+                print("  No results or empty result set")
+        
+        # Print analysis text
+        print(f"\nAnalysis:\n{result.get('text', 'No analysis provided')}")
+    else:
+        # Print single SQL and response
+        print(f"SQL: {result.get('sql')}")
+        print(f"Text Response: {result.get('text', 'No text response')}")
+        
+        # Format and print results if available
+        if result.get("results") and len(result["results"]) > 0:
+            print(f"Results: (showing {min(3, len(result['results']))} of {len(result['results'])} rows)")
+            for i, row in enumerate(result["results"][:3]):
+                print(f"  Row {i+1}: {json.dumps(row, indent=2)}")
+        else:
+            print("No results or empty result set")
+    
+    return result
 
-    # Make a follow-up query to test memory
-    print("\n5. Making a follow-up query to test memory...")
-    query_data = {
-        "question": "Which of those had the highest subtotal?",
+def test_pagination(session_id, query):
+    """Test executing a query that returns paginated results"""
+    url = f"{API_BASE_URL}/sessions/{session_id}/query"
+    
+    # Query details
+    payload = {
+        "question": query,
         "auto_fix": True
     }
-    response = requests.post(f"{BASE_URL}/sessions/{session_id}/query", json=query_data)
-    print_json(response.json())
-
-    # Make a query without session
-    print("\n6. Making a query without session...")
-    query_data = {
-        "question": "Show me the total number of customers"
-    }
-    response = requests.post(f"{BASE_URL}/query", json=query_data)
-    print_json(response.json())
-
-    # List all sessions
-    print("\n7. Listing all sessions...")
-    response = requests.get(f"{BASE_URL}/sessions")
-    print_json(response.json())
-
-    # Delete the session
-    print(f"\n8. Deleting session {session_id}...")
-    response = requests.delete(f"{BASE_URL}/sessions/{session_id}")
-    print_json(response.json())
+    
+    # Execute the initial query
+    response = requests.post(url, json=payload)
+    print(f"\n=== Pagination Test: '{query}' ===")
+    print(f"Status Code: {response.status_code}")
+    
+    # Format the results for readability
+    result = response.json()
+    
+    # Check if pagination is available
+    if "pagination" in result:
+        pagination = result["pagination"]
+        table_id = pagination["table_id"]
+        total_rows = pagination["total_rows"]
+        total_pages = pagination["total_pages"]
+        
+        print(f"Query returned {total_rows} rows with pagination")
+        print(f"Table ID: {table_id}")
+        print(f"Total pages: {total_pages}")
+        print(f"First page results: {len(result['results'])} rows")
+        
+        # Print first page results
+        for i, row in enumerate(result["results"]):
+            print(f"  Row {i+1}: {json.dumps(row, indent=2)}")
+        
+        # If there are more pages, fetch the second page
+        if total_pages > 1:
+            page_url = f"{API_BASE_URL}/sessions/{session_id}/results/{table_id}?page=2"
+            page_response = requests.get(page_url)
+            
+            if page_response.status_code == 200:
+                page_result = page_response.json()
+                print(f"\nSecond page results: {len(page_result['results'])} rows")
+                
+                # Print second page results
+                for i, row in enumerate(page_result["results"]):
+                    print(f"  Row {i+1}: {json.dumps(row, indent=2)}")
+            else:
+                print(f"Failed to fetch second page: {page_response.status_code}")
+    else:
+        print("No pagination available for this query")
+        print(f"SQL: {result.get('sql')}")
+        print(f"Results: {len(result.get('results', []))} rows")
+    
+    return result
 
 if __name__ == "__main__":
-    test_api() 
+    # Create a session
+    session_id = test_create_session()
+    
+    if session_id:
+        # Test regular SQL query
+        test_sql_query(session_id, "Show me the top 5 customers by total order amount")
+        
+        # Test a conversational query (no SQL)
+        test_conversational_query(session_id, "What is a relational database?")
+        
+        # Test a follow-up conversational query
+        test_conversational_query(session_id, "How does it differ from NoSQL?")
+        
+        # Test LLM-related conversational queries
+        test_conversational_query(session_id, "Tell me which LLM are you using behind the scenes")
+        test_conversational_query(session_id, "What model powers your responses?")
+        test_conversational_query(session_id, "How does this system work?")
+        
+        # Test a single-query analysis
+        test_analysis_query(session_id, "Show me the sales for 2014 and provide a brief analysis")
+        
+        # Test a comparative analysis query (likely multi-query)
+        test_analysis_query(session_id, "Compare sales from 2014 versus 2013 and explain any significant differences")
+        
+        # Test a "why" analysis question
+        test_analysis_query(session_id, "Why are our sales decreasing compared to last quarter of 2013?")
+        
+        # Test pagination
+        test_pagination(session_id, "List all sales from 2014 and 2013")
+    else:
+        print("Failed to create session. Check your database connection settings.") 
