@@ -1,69 +1,88 @@
-import { ReactNode } from 'react';
-import { Bot, User } from 'lucide-react';
+import { User, Bot } from 'lucide-react';
+import { formatRelative } from 'date-fns';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 interface MessageProps {
   isUser: boolean;
-  content: ReactNode;
-  timestamp?: Date;
+  content: string;
+  timestamp: Date;
+  isConversational?: boolean;
 }
 
-export default function Message({ isUser, content, timestamp }: MessageProps) {
+export default function Message({ isUser, content, timestamp, isConversational = false }: MessageProps) {
+  const formattedTime = formatRelative(new Date(timestamp), new Date());
+  
+  // Fix table formatting issues by ensuring proper markdown syntax
+  let processedContent = content;
+  
+  // Fix common table formatting issues
+  if (content.includes('|')) {
+    // Remove extra spaces between table rows that break markdown tables
+    processedContent = content
+      .replace(/\|\s*\n\s*\|/g, '|\n|')
+      .replace(/\|\s*\n\n\s*\|/g, '|\n|');
+    
+    // Fix malformed table headers/separators
+    const lines = processedContent.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      // If this looks like a table separator row with errors
+      if (lines[i].trim().startsWith('|') && lines[i].includes('--') && !lines[i].includes('|--')) {
+        // Fix the separator line format
+        lines[i] = lines[i].replace(/\s*\|\s*/g, ' | ').replace(/\s*-+\s*/g, ' --- ');
+      }
+    }
+    processedContent = lines.join('\n');
+  }
+
   return (
-    <div className={`flex w-full mb-6 ${isUser ? 'justify-end' : 'justify-start'}`}>
-      <div className={`flex max-w-[85%] gap-3 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}>
-        {/* Avatar */}
-        <div className={`flex-shrink-0 h-10 w-10 rounded-full flex items-center justify-center shadow-lg transition-all duration-300 ${
-          isUser 
-            ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white' 
-            : 'bg-gradient-to-r from-emerald-500 to-teal-600 text-white'
-        }`}>
-          {isUser ? <User className="h-5 w-5" /> : <Bot className="h-5 w-5" />}
+    <div className={`flex gap-3 ${isUser ? 'justify-end' : ''}`}>
+      {!isUser && (
+        <div className="flex-shrink-0">
+          <div className="h-9 w-9 rounded-full shadow-sm bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center">
+            <Bot className="h-5 w-5 text-white" />
+          </div>
         </div>
-        
-        {/* Message Content */}
-        <div className={`relative transition-all duration-300 hover:shadow-lg ${
-          isUser ? 'transform hover:-translate-y-1' : 'transform hover:-translate-y-1'
-        }`}>
-          <div
-            className={`rounded-2xl px-5 py-4 shadow-md transition-all duration-300 ${
-              isUser
-                ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white rounded-br-md'
-                : 'bg-white text-gray-800 rounded-bl-md border border-gray-100 shadow-lg'
-            }`}
+      )}
+      
+      <div className={`max-w-[80%] sm:max-w-[70%] ${isUser ? 'order-1' : 'order-2'}`}>
+        <div 
+          className={`px-4 py-3 rounded-xl shadow-sm ${
+            isUser
+              ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white'
+              : isConversational
+                ? 'bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-100'
+                : 'bg-white border border-gray-100'
+          }`}
+        >
+          <div 
+            className={`prose prose-sm max-w-none ${
+              isUser 
+                ? 'prose-invert' 
+                : isConversational
+                  ? 'prose-indigo'
+                  : 'prose-gray'
+            } prose-table:table-auto prose-table:w-full prose-td:p-2 prose-th:p-2 prose-thead:bg-gray-100 prose-tr:border-b prose-tr:border-gray-200`}
           >
-            {typeof content === 'string' ? (
-              <p className="text-sm leading-relaxed font-medium">{content}</p>
-            ) : (
-              content
-            )}
-            
-            {timestamp && (
-              <div className={`text-xs mt-2 ${
-                isUser ? 'text-blue-100' : 'text-gray-400'
-              }`}>
-                {timestamp.toLocaleTimeString([], { 
-                  hour: '2-digit', 
-                  minute: '2-digit',
-                  hour12: true 
-                })}
-              </div>
-            )}
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{processedContent}</ReactMarkdown>
           </div>
-          
-          {/* Message tail */}
-          <div className={`absolute top-4 ${
-            isUser 
-              ? 'right-0 translate-x-full' 
-              : 'left-0 -translate-x-full'
-          }`}>
-            <div className={`w-0 h-0 ${
-              isUser
-                ? 'border-t-[8px] border-t-transparent border-l-[12px] border-l-blue-600 border-b-[8px] border-b-transparent'
-                : 'border-t-[8px] border-t-transparent border-r-[12px] border-r-white border-b-[8px] border-b-transparent'
-            }`} />
-          </div>
+        </div>
+        <div 
+          className={`text-xs text-gray-400 mt-1 ${
+            isUser ? 'text-right' : 'text-left'
+          }`}
+        >
+          {formattedTime}
         </div>
       </div>
+      
+      {isUser && (
+        <div className="flex-shrink-0 order-3">
+          <div className="h-9 w-9 rounded-full shadow-sm bg-gradient-to-br from-gray-700 to-gray-900 flex items-center justify-center">
+            <User className="h-5 w-5 text-white" />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
