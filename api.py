@@ -109,10 +109,23 @@ def create_session(session_req: SessionRequest):
         host = session_req.host or os.getenv("DB_HOST", "localhost")
         port = session_req.port or os.getenv("DB_PORT", "5432")
 
-        print(db_name, username, password, host, port)
+        print(f"Attempting to connect with: DB={db_name}, User={username}, Host={host}, Port={port}")
         
-        # Initialize database analyzer
-        db_analyzer = DatabaseAnalyzer(db_name, username, password, host, port)
+        # Try to encode/decode the password to detect non-UTF-8 characters
+        try:
+            # Test if password contains non-UTF-8 characters
+            password.encode('utf-8').decode('utf-8')
+        except UnicodeError as ue:
+            print(f"Password contains non-UTF-8 characters: {ue}")
+            # Use a safe version of the password (or consider URL encoding it)
+            password = ''.join(c for c in password if ord(c) < 128)
+        
+        # Initialize database analyzer with more detailed error handling
+        try:
+            db_analyzer = DatabaseAnalyzer(db_name, username, password, host, port)
+        except Exception as db_error:
+            print(f"Database analyzer initialization error: {str(db_error)}")
+            raise Exception(f"Database connection error: {str(db_error)}")
         
         # Create a memory directory specific to this session
         session_id = str(uuid.uuid4())
@@ -146,6 +159,9 @@ def create_session(session_req: SessionRequest):
         }
     
     except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"Session creation error: {str(e)}\n{error_trace}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create session: {str(e)}"

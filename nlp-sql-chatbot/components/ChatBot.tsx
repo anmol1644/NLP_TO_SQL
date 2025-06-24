@@ -3,18 +3,53 @@ import { Database, MessageSquare, Settings, Wifi, WifiOff } from 'lucide-react';
 import Message from './Message';
 import SqlResult from './SqlResult';
 import SessionManager from './SessionManager';
-import { executeQuery, getSessionInfo } from '../lib/api';
+import { executeQuery, getSessionInfo, getPaginatedResults } from '../lib/api';
+
+// PaginationInfo interface to match the API response
+interface PaginationInfo {
+  table_id: string;
+  current_page: number;
+  total_pages: number;
+  total_rows: number;
+  page_size: number;
+  has_next?: boolean;
+  has_prev?: boolean;
+}
+
+interface TableInfo {
+  name: string;
+  description: string;
+  sql: string;
+  results: any[];
+  row_count: number;
+  table_id?: string;
+  pagination?: PaginationInfo;
+}
 
 interface ChatMessage {
   id: string;
   isUser: boolean;
   text: string;
   timestamp: Date;
+  query_type?: 'conversational' | 'sql' | 'analysis';
   sqlResult?: {
     sql: string;
     data?: any[];
     error?: string;
+    pagination?: PaginationInfo;
+    table_id?: string;
   };
+  analysisResult?: {
+    tables: TableInfo[];
+    analysis_type: 'causal' | 'comparative';
+  };
+}
+
+// Add a new interface for tracking pagination state
+interface PaginationState {
+  messageId: string;
+  tableId: string;
+  currentPage: number;
 }
 
 export default function ChatBot() {
@@ -31,6 +66,7 @@ export default function ChatBot() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionInfo, setSessionInfo] = useState<any>(null);
   const [showSessionManager, setShowSessionManager] = useState(false);
+  const [paginationState, setPaginationState] = useState<PaginationState | null>(null);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -83,37 +119,47 @@ export default function ChatBot() {
     try {
       const result = await executeQuery(input, sessionId || undefined);
       
-      let responseMessage = result.message || 'Query executed successfully.';
-      
-      if (result.success && result.data && result.data.length > 0) {
-        const rowCount = result.data.length;
-        const rowText = rowCount === 1 ? 'row' : 'rows';
-        responseMessage = `Found ${rowCount} ${rowText} in the database.`;
-        
-        if (rowCount <= 5) {
-          const firstRow = result.data[0];
-          const colCount = Object.keys(firstRow).length;
-          
-          if (colCount <= 3 && rowCount === 1) {
-            const entries = Object.entries(firstRow);
-            responseMessage = entries.map(([key, value]) => {
-              return `The ${key.replace(/_/g, ' ')} is ${value}.`;
-            }).join(' ');
-          }
-        }
-      }
-      
+      let responseMessage = result.text || result.message || 'Query executed successfully.';
       const botMessage: ChatMessage = {
         id: `response-${Date.now()}`,
         isUser: false,
         text: responseMessage,
         timestamp: new Date(),
-        sqlResult: {
+        query_type: result.query_type,
+      };
+      
+      // Handle different response types
+      if (result.query_type === 'sql') {
+        botMessage.sqlResult = {
           sql: result.sql || '',
           data: result.data,
           error: result.error,
-        },
-      };
+          pagination: result.pagination,
+          table_id: result.table_id,
+        };
+        
+        // Log for debugging
+        console.log('SQL Result with pagination:', {
+          tableId: result.table_id,
+          pagination: result.pagination
+        });
+      } else if (result.query_type === 'analysis') {
+        // Each table should have its own table_id for pagination
+        const tablesWithIds = result.tables.map((table: any) => {
+          console.log('Analysis table:', table);
+          return {
+            ...table,
+            table_id: table.table_id || `table-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+            pagination: table.pagination
+          };
+        });
+        
+        botMessage.analysisResult = {
+          tables: tablesWithIds,
+          analysis_type: result.analysis_type
+        };
+      }
+      // For conversational queries, we just use the text
       
       setMessages((prev) => [...prev, botMessage]);
     } catch (error: any) {
@@ -142,6 +188,74 @@ export default function ChatBot() {
     };
     
     setMessages((prev) => [...prev, systemMessage]);
+  };
+
+  const handlePageChange = async (messageId: string, tableId: string, newPage: number) => {
+    if (!sessionId || !tableId) {
+      console.error('Missing session ID or table ID for pagination', { sessionId, tableId });
+      return;
+    }
+    
+    console.log(`Fetching page ${newPage} for table ${tableId} in session ${sessionId}`);
+    setIsProcessing(true);
+    
+    try {
+      const result = await getPaginatedResults(sessionId, tableId, newPage);
+      console.log('Paginated results:', result);
+      
+      // Make sure we have the current table_id (it might have changed in the response)
+      const currentTableId = result.pagination?.table_id || tableId;
+      
+      // Update the message with the new data
+      setMessages((prevMessages) => 
+        prevMessages.map((msg) => {
+          if (msg.id === messageId && msg.sqlResult) {
+            return {
+              ...msg,
+              sqlResult: {
+                ...msg.sqlResult,
+                data: result.data,
+                pagination: result.pagination,
+                table_id: currentTableId
+              }
+            };
+          } else if (msg.id === messageId && msg.analysisResult) {
+            // For analysis results, find and update the specific table
+            const updatedTables = msg.analysisResult.tables.map(table => {
+              if (table.table_id === tableId) {
+                return {
+                  ...table,
+                  results: result.data,
+                  pagination: result.pagination,
+                  table_id: currentTableId
+                };
+              }
+              return table;
+            });
+            
+            return {
+              ...msg,
+              analysisResult: {
+                ...msg.analysisResult,
+                tables: updatedTables,
+              }
+            };
+          }
+          return msg;
+        })
+      );
+      
+      // Update pagination state
+      setPaginationState({
+        messageId,
+        tableId: currentTableId,
+        currentPage: newPage,
+      });
+    } catch (error) {
+      console.error('Error fetching paginated results:', error);
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
   return (
@@ -202,14 +316,38 @@ export default function ChatBot() {
                   isUser={message.isUser}
                   content={message.text}
                   timestamp={message.timestamp}
+                  isConversational={!message.isUser && message.query_type === 'conversational'}
                 />
-                {message.sqlResult && (
+                {/* Render different types of results based on query_type */}
+                {message.query_type === 'sql' && message.sqlResult && (
                   <div className="ml-4 mt-4 animate-in fade-in duration-700">
                     <SqlResult
                       sql={message.sqlResult.sql}
                       data={message.sqlResult.data}
                       error={message.sqlResult.error}
+                      pagination={message.sqlResult.pagination}
+                      onPageChange={(page) => handlePageChange(message.id, message.sqlResult?.table_id || '', page)}
+                      sessionId={sessionId || undefined}
+                      tableId={message.sqlResult.table_id}
                     />
+                  </div>
+                )}
+                {message.query_type === 'analysis' && message.analysisResult && (
+                  <div className="ml-4 mt-4 animate-in fade-in duration-700">
+                    {message.analysisResult.tables.map((table, tableIndex) => (
+                      <div key={tableIndex} className="mb-8 last:mb-0">
+                        <SqlResult
+                          sql={table.sql}
+                          data={table.results}
+                          title={table.name}
+                          description={table.description}
+                          pagination={table.pagination}
+                          onPageChange={(page) => handlePageChange(message.id, table.table_id || '', page)}
+                          sessionId={sessionId || undefined}
+                          tableId={table.table_id}
+                        />
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
