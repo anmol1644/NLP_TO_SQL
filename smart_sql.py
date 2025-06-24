@@ -3,6 +3,7 @@ import time
 import hashlib
 import json
 import re
+import uuid
 from typing import Dict, List, Optional, Tuple, Any, Union
 
 import google.generativeai as genai
@@ -53,13 +54,18 @@ class SmartSQLGenerator:
         self.cache = self._load_cache() if use_cache else {}
         self.use_memory = use_memory
         
+        # Data store for paginated results
+        self.paginated_results = {}
+        
         # Session-specific memory for tracking conversation context
         self.session_context = {
             "user_info": {},
             "query_sequence": [],
             "important_values": {},
             "last_query_result": None,
-            "entity_mentions": {}
+            "entity_mentions": {},
+            "text_responses": [],  # Store text responses
+            "multi_query_results": []  # Store results from multiple queries
         }
         
         # Initialize the AI model
@@ -114,6 +120,8 @@ Convert the following question into a single PostgreSQL SQL query:
 13. When user refers to "those" or "these" results with terms like "highest" or "lowest", ONLY consider the exact rows from the previous result set, NOT the entire table
 14. If IDs from previous results are provided in the memory context, use them in a WHERE clause to limit exactly to those rows
 15. Only those tables must be joined that have a foreign key relationship with the table being queried
+16. IMPORTANT: When the user asks for "all" or "list all" data, DO NOT use aggregation functions (SUM, COUNT, AVG) unless explicitly requested. Return the raw data rows.
+17. When the user asks to "show" or "list" data without explicitly asking for aggregation, return the individual rows rather than summary statistics.
 
 ### OUTPUT FORMAT:
 Provide ONLY the SQL query with no additional text, explanation, or markdown formatting.
@@ -161,6 +169,176 @@ Provide ONLY the corrected SQL query with no additional text, explanation, or ma
         self.validation_chain = LLMChain(
             llm=self.llm,
             prompt=self.validation_prompt
+        )
+
+        # Define text response prompt
+        self.text_response_prompt = PromptTemplate(
+            input_variables=["schema", "question", "results", "sql"] + (["memory"] if use_memory else []),
+            template=f"""You are a helpful database assistant who helps answer questions about data.
+
+{memory_var}### DATABASE SCHEMA:
+{{schema}}
+
+### USER QUESTION:
+"{{question}}"
+
+### SQL QUERY:
+```sql
+{{sql}}
+```
+
+### QUERY RESULTS:
+```
+{{results}}
+```
+
+### TASK:
+Based on the question and the SQL query results, provide a natural language response.
+
+### GUIDELINES:
+1. If the user asked for specific data analysis, provide insights and analysis based on the results
+2. If the user asked a question that doesn't require SQL, answer it directly based on your knowledge
+3. Keep your response concise and focused on answering the question
+4. Include relevant numbers and metrics from the results if available
+5. Format numeric values appropriately (e.g., large numbers with commas, percentages, currencies)
+6. For small result sets, you can mention specific data points
+7. For large result sets, summarize the overall trends or patterns
+8. If the results are empty, explain what that means in context
+9. Use the schema information to provide more context when needed
+10. If there was an error in the SQL query, explain what might have gone wrong
+11. For questions about the system itself:
+   - If asked about what LLM you're using, say you're using Google's Gemini model
+   - If asked about the system architecture, explain it's a natural language to SQL system using LLMs
+   - If asked about capabilities, explain you can translate natural language to SQL and analyze data
+   - Be honest and straightforward about your capabilities and limitations
+
+### OUTPUT FORMAT:
+Provide a natural language response that directly answers the user's question. Be helpful, clear, and concise.
+"""
+        )
+        
+        # Create the text response chain
+        self.text_response_chain = LLMChain(
+            llm=self.llm,
+            prompt=self.text_response_prompt
+        )
+
+        # Define conversation prompt for non-SQL conversations
+        self.conversation_prompt = PromptTemplate(
+            input_variables=["schema", "question"] + (["memory"] if use_memory else []),
+            template=f"""You are a helpful database assistant who helps answer questions about data and databases.
+
+{memory_var}### DATABASE SCHEMA:
+{{schema}}
+
+### USER QUESTION:
+"{{question}}"
+
+### TASK:
+Respond to the user's question. This appears to be a general question that doesn't require generating SQL.
+
+### GUIDELINES:
+1. If the question is about databases or data concepts, provide a helpful explanation
+2. If the question is about the schema or structure of the database, refer to the schema information
+3. If the question is unrelated to databases, provide a general helpful response
+4. Be concise and direct in your response
+5. Use your knowledge about databases and SQL when relevant
+6. If the question might benefit from executing SQL but is currently phrased as a conversation, suggest what specific data the user might want to query
+7. For questions about the system itself:
+   - If asked about what LLM you're using, say you're using Google's Gemini model
+   - If asked about the system architecture, explain it's a natural language to SQL system using LLMs
+   - If asked about capabilities, explain you can translate natural language to SQL and analyze data
+   - Be honest and straightforward about your capabilities and limitations
+
+### OUTPUT FORMAT:
+Provide a natural language response that directly answers the user's question. Be helpful, clear, and concise.
+"""
+        )
+        
+        # Create the conversation chain
+        self.conversation_chain = LLMChain(
+            llm=self.llm,
+            prompt=self.conversation_prompt
+        )
+
+        # Define multi-query analysis prompt
+        self.analysis_prompt = PromptTemplate(
+            input_variables=["schema", "question", "tables_info"] + (["memory"] if use_memory else []),
+            template=f"""You are an expert data analyst who helps analyze database query results.
+
+{memory_var}### DATABASE SCHEMA:
+{{schema}}
+
+### USER QUESTION:
+"{{question}}"
+
+### QUERY RESULTS:
+{{tables_info}}
+
+### TASK:
+Analyze the query results to answer the user's question. The user has requested a complex analysis that required multiple queries.
+
+### GUIDELINES:
+1. Compare and analyze data across the multiple tables provided
+2. Identify trends, anomalies, or patterns in the data
+3. Provide insights that directly answer the user's question
+4. Reference specific numbers from the results to support your analysis
+5. Use proper statistical reasoning when making comparisons
+6. For time-based comparisons (such as year-over-year), calculate and explain percentage changes
+7. Be concise yet thorough in your explanation
+8. Format numbers appropriately (with commas for thousands, percentages with % sign)
+9. If appropriate, suggest potential reasons for patterns observed in the data
+10. When analyzing financial data, consider both absolute and relative changes
+11. For comparisons between periods, highlight significant changes and potential causes
+
+### OUTPUT FORMAT:
+Provide a thorough analysis of the data that directly answers the user's question. Be insightful, clear, and data-driven.
+"""
+        )
+        
+        # Create the analysis chain
+        self.analysis_chain = LLMChain(
+            llm=self.llm,
+            prompt=self.analysis_prompt
+        )
+
+        # Define query planning prompt for complex questions
+        self.query_planner_prompt = PromptTemplate(
+            input_variables=["schema", "question"] + (["memory"] if use_memory else []),
+            template=f"""You are an expert SQL database analyst with deep knowledge of PostgreSQL databases. Your job is to plan the SQL queries needed to answer complex questions.
+
+{memory_var}### DATABASE SCHEMA:
+{{schema}}
+
+### USER QUESTION:
+"{{question}}"
+
+### TASK:
+Identify if the user's question requires a single SQL query or multiple SQL queries for proper analysis. 
+For simple data retrieval, a single query is sufficient. For questions involving comparison, trend analysis, or "explain why" type questions, multiple queries are typically needed.
+
+### GUIDELINES:
+1. Analyze if the question requires multiple SQL queries or just a single query
+2. For comparison questions (e.g., "compare to last year", "why are sales down"), plan multiple queries
+3. Identify specific time periods, metrics, or entities that need to be queried separately
+
+### OUTPUT FORMAT:
+Answer in key-value format, following this exact format:
+
+NEEDS_MULTIPLE_QUERIES: yes/no
+NUMBER_OF_QUERIES_NEEDED: [number]
+QUERY_PLAN:
+- Query 1: [description of first query]
+- Query 2: [description of second query]
+...
+ANALYSIS_APPROACH: [brief description of how these queries will help answer the question]
+"""
+        )
+        
+        # Create the query planner chain
+        self.query_planner_chain = LLMChain(
+            llm=self.llm,
+            prompt=self.query_planner_prompt
         )
         
         # Prepare schema context
@@ -751,6 +929,888 @@ WHERE (
                 "execution_time": time.time() - start_time
             }
     
+    def generate_text_response(self, question: str, sql: str = None, results: Any = None) -> Dict[str, Any]:
+        """
+        Generate a natural language text response based on the question, SQL query, and results
+        
+        Args:
+            question: Natural language question
+            sql: SQL query (if available)
+            results: Query results (if available)
+            
+        Returns:
+            Dictionary with text generation details
+        """
+        start_time = time.time()
+        
+        # Prepare schema context if not already prepared
+        self._prepare_schema_context()
+        
+        try:
+            # Determine if this is a conversational query or needs SQL analysis
+            is_sql_related = sql is not None and results is not None
+            
+            if is_sql_related:
+                # Format results for the model
+                results_formatted = self._format_results_for_display(results)
+                
+                # Prepare params for text response generation
+                params = {
+                    "schema": self.schema_context,
+                    "question": question,
+                    "sql": sql,
+                    "results": results_formatted
+                }
+                
+                # Add memory if enabled
+                if self.use_memory:
+                    memory_context = self._prepare_memory_for_query(question) or ""
+                    params["memory"] = memory_context
+                    
+                # Generate text response with SQL analysis
+                response = self.text_response_chain.invoke(params)
+            else:
+                # This is a conversational query, no SQL needed
+                params = {
+                    "schema": self.schema_context,
+                    "question": question
+                }
+                
+                # Add memory if enabled
+                if self.use_memory:
+                    memory_context = self._prepare_memory_for_query(question) or ""
+                    params["memory"] = memory_context
+                
+                # Generate conversational response
+                response = self.conversation_chain.invoke(params)
+            
+            if isinstance(response, dict) and "text" in response:
+                text_response = response["text"].strip()
+            else:
+                return {
+                    "success": False,
+                    "text": "Unable to generate a response.",
+                    "generation_time": time.time() - start_time
+                }
+            
+            # Store in session context for future reference
+            if self.session_context:
+                self.session_context["text_responses"].append({
+                    "question": question,
+                    "text": text_response,
+                    "timestamp": time.time()
+                })
+                
+                # Limit stored responses to last 10
+                if len(self.session_context["text_responses"]) > 10:
+                    self.session_context["text_responses"] = self.session_context["text_responses"][-10:]
+            
+            # Store in memory if enabled
+            if self.use_memory:
+                self._store_text_in_memory(question, text_response, sql, results)
+            
+            return {
+                "success": True,
+                "text": text_response,
+                "generation_time": time.time() - start_time
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "text": f"Error generating text response: {str(e)}",
+                "generation_time": time.time() - start_time
+            }
+    
+    def _format_results_for_display(self, results: Any) -> str:
+        """Format query results for display in text responses"""
+        if not results:
+            return "No results returned."
+        
+        try:
+            # For list results, format as a table or list
+            if isinstance(results, list):
+                if not results:
+                    return "Empty result set."
+                
+                # Convert to pandas DataFrame for string formatting
+                import pandas as pd
+                df = pd.DataFrame(results)
+                
+                # Format with reasonable width constraints
+                with pd.option_context('display.max_rows', 20, 'display.max_columns', 20, 'display.width', 1000):
+                    formatted = df.to_string(index=False)
+                    
+                    # If too long, truncate
+                    if len(formatted) > 4000:
+                        formatted = formatted[:4000] + "\n... [truncated]"
+                    
+                    return formatted
+            else:
+                # For other types, use string representation
+                return str(results)
+        except Exception as e:
+            return f"Error formatting results: {e}"
+    
+    def _store_text_in_memory(self, question: str, text_response: str, sql: str = None, results: Any = None) -> None:
+        """Store text responses in memory for future reference"""
+        if not self.memory or not self.use_memory:
+            return
+            
+        try:
+            # Create content with question and response
+            content = f"Question: {question}\nResponse: {text_response}"
+            
+            # Add SQL context if available
+            if sql:
+                content += f"\nSQL: {sql}"
+            
+            # Add result summary if available (brief)
+            if results and isinstance(results, list):
+                num_rows = len(results)
+                content += f"\nReturned {num_rows} rows"
+            
+            # Store in memory
+            self.memory.save_context(
+                {"question": question}, 
+                {"memory": content}
+            )
+        except Exception as e:
+            print(f"Error storing text in memory: {e}")
+
+    def _is_analysis_question(self, question: str) -> bool:
+        """
+        Check if the question requires data analysis with potentially multiple queries
+        
+        Args:
+            question: The natural language question
+            
+        Returns:
+            True if the question requires analysis with potentially multiple queries
+        """
+        # Keywords indicating analysis
+        analysis_keywords = [
+            "analyze", "analysis", "compare", "comparison", "trend", 
+            "why", "reason", "explain", "growth", "decline", "difference",
+            "versus", "vs", "against", "performance", "over time",
+            "year over year", "month over month", "quarter over quarter",
+            "decreasing", "increasing", "dropping", "rising", "falling", 
+            "higher", "lower", "better", "worse", "improved", "deteriorated"
+        ]
+        
+        # Check for comparison between time periods
+        time_comparisons = [
+            r"compare.*last\s+(year|month|quarter|week|period)",
+            r"compare.*previous\s+(year|month|quarter|week|period)",
+            r"(higher|lower|more|less|greater|fewer).*than\s+(last|previous)\s+(year|month|quarter|week|period)",
+            r"(increase|decrease|change|drop|rise|fall)\s+from\s+(last|previous)\s+(year|month|quarter|week|period)",
+            r"(increase|decrease|change|drop|rise|fall)\s+since\s+(last|previous)\s+(year|month|quarter|week|period)",
+            r"(increase|decrease|change|drop|rise|fall)\s+compared to\s+(last|previous)\s+(year|month|quarter|week|period)",
+            r"(this|current)\s+(year|month|quarter|week|period).*compared to",
+            r"(this|current).*vs\.?\s+(last|previous)",
+            r"why\s+(is|are|were|was|have|has|had)\s+.*(increase|decrease|change|higher|lower|more|less|drop|rise|fall)"
+        ]
+        
+        # Check if the question starts with "why" - these almost always need analysis
+        if question.lower().strip().startswith("why"):
+            return True
+            
+        # Check if the question contains analysis keywords
+        question_lower = question.lower()
+        
+        # Strong indicators of needing analysis
+        if any(keyword in question_lower for keyword in analysis_keywords):
+            return True
+            
+        # Check for time comparison patterns
+        for pattern in time_comparisons:
+            if re.search(pattern, question_lower):
+                return True
+                
+        return False
+    
+    def _is_why_question(self, question: str) -> bool:
+        """
+        Check if the question is a 'why' question that requires deeper causal analysis
+        
+        Args:
+            question: The natural language question
+            
+        Returns:
+            True if this is a 'why' question requiring causal analysis
+        """
+        question_lower = question.lower().strip()
+        
+        # Direct "why" questions
+        if question_lower.startswith("why"):
+            return True
+            
+        # Questions about reasons or causes
+        reason_patterns = [
+            r"what\s+(is|are|were|was)\s+the\s+reason",
+            r"what\s+caused",
+            r"reason\s+for",
+            r"cause\s+of",
+            r"explain\s+why",
+            r"how\s+come",
+            r"tell\s+me\s+why",
+            r"factors\s+(behind|causing)",
+            r"what\s+explains",
+        ]
+        
+        for pattern in reason_patterns:
+            if re.search(pattern, question_lower):
+                return True
+                
+        return False
+        
+    def handle_why_question(self, question: str) -> Dict[str, Any]:
+        """
+        Handle 'why' questions that require deeper causal analysis between time periods
+        
+        Args:
+            question: The natural language question asking for causal analysis
+            
+        Returns:
+            Dictionary with execution results including comparative analysis
+        """
+        start_time = time.time()
+        
+        print(f"Handling 'why' question: {question}")
+        
+        # Step 1: Determine the key metrics and time periods that need to be compared
+        time_periods_to_analyze = self._extract_time_periods_from_question(question)
+        
+        if not time_periods_to_analyze:
+            # Default to comparing current period with previous period
+            time_periods_to_analyze = [
+                {"name": "Current period", "description": "Most recent data"},
+                {"name": "Previous period", "description": "Period before the most recent data for comparison"}
+            ]
+        
+        # Step 2: Generate queries for each time period
+        query_results = []
+        tables_info = []
+        
+        for period in time_periods_to_analyze:
+            # Construct a query specific to this time period
+            period_question = f"Show the relevant metrics for {period['name']}: {period['description']}"
+            
+            # Add the original question for context
+            period_question += f". This is part of answering: {question}"
+            
+            # Generate SQL for this specific time period
+            sql_generation = self.generate_sql(period_question)
+            
+            if not sql_generation["success"] or not sql_generation.get("sql"):
+                print(f"Failed to generate SQL for {period['name']}")
+                continue
+                
+            sql = sql_generation["sql"]
+            
+            # Execute the SQL
+            success, results, error = self.db_analyzer.execute_query(sql)
+            
+            if not success or not results:
+                print(f"Failed to get results for {period['name']}: {error}")
+                continue
+                
+            # Store the successful query and results
+            query_results.append({
+                "query_name": period["name"],
+                "sql": sql,
+                "results": results,
+                "row_count": len(results),
+                "description": period["description"]
+            })
+        
+        # If we don't have at least two successful queries for comparison, try a combined approach
+        if len(query_results) < 2:
+            print("Insufficient period data, attempting combined query approach")
+            
+            # Generate a single comprehensive query that includes time period as a dimension
+            combined_question = f"Show data across different time periods to analyze {question}"
+            sql_generation = self.generate_sql(combined_question)
+            
+            if sql_generation["success"] and sql_generation.get("sql"):
+                sql = sql_generation["sql"]
+                success, results, error = self.db_analyzer.execute_query(sql)
+                
+                if success and results:
+                    query_results.append({
+                        "query_name": "Combined period analysis",
+                        "sql": sql,
+                        "results": results,
+                        "row_count": len(results),
+                        "description": "Combined analysis across time periods"
+                    })
+        
+        # If still no successful queries, return error
+        if not query_results:
+            print("No successful queries for 'why' analysis")
+            return {
+                "success": False,
+                "question": question,
+                "error": "Failed to retrieve data for analysis",
+                "execution_time": time.time() - start_time
+            }
+        
+        # Step 3: Process results for analysis
+        print(f"Preparing {len(query_results)} query results for 'why' analysis")
+        for qr in query_results:
+            results = qr["results"]
+            query_name = qr["query_name"]
+            
+            # Apply the same large result handling as in execute_multi_query_analysis
+            if len(results) > 100:
+                # Include statistics for large result sets
+                import pandas as pd
+                import numpy as np
+                
+                df = pd.DataFrame(results)
+                
+                # Get statistics
+                stats = {}
+                numeric_cols = df.select_dtypes(include=[np.number]).columns
+                for col in numeric_cols:
+                    stats[col] = {
+                        "min": df[col].min() if not pd.isna(df[col].min()) else "N/A",
+                        "max": df[col].max() if not pd.isna(df[col].max()) else "N/A",
+                        "mean": df[col].mean() if not pd.isna(df[col].mean()) else "N/A",
+                        "median": df[col].median() if not pd.isna(df[col].median()) else "N/A"
+                    }
+                
+                # Sample rows
+                sampled_rows = []
+                sampled_rows.extend(results[:20])
+                
+                if len(results) > 40:
+                    sampled_rows.append({"note": "... skipping middle rows ..."})
+                    sampled_rows.extend(results[-20:])
+                
+                table_formatted = (
+                    f"LARGE RESULT SET: {len(results)} rows total, showing first 20 and last 20 rows.\n\n"
+                    f"STATISTICS FOR NUMERIC COLUMNS:\n{json.dumps(stats, indent=2)}\n\n"
+                    f"SAMPLED ROWS:\n{self._format_results_for_display(sampled_rows)}"
+                )
+            else:
+                table_formatted = self._format_results_for_display(results)
+            
+            # Add formatted table to tables_info
+            tables_info.append(
+                f"### {query_name} ###\n"
+                f"DESCRIPTION: {qr.get('description', '')}\n"
+                f"SQL:\n```sql\n{qr['sql']}\n```\n\n"
+                f"RESULTS ({qr['row_count']} rows):\n{table_formatted}\n"
+            )
+        
+        # Step 4: Generate specialized causal analysis with focus on explaining "why"
+        print("Generating causal analysis for 'why' question")
+        tables_info_text = "\n\n".join(tables_info)
+        
+        # Create specialized prompt that focuses on explaining causes
+        causal_analysis_prompt = PromptTemplate(
+            input_variables=["schema", "question", "tables_info"] + (["memory"] if self.use_memory else []),
+            template=f"""You are an expert data analyst specialized in explaining causes and reasons behind business trends.
+
+{"{{memory}}\n\n" if self.use_memory else ""}### DATABASE SCHEMA:
+{{schema}}
+
+### USER QUESTION:
+"{{question}}"
+
+### QUERY RESULTS:
+{{tables_info}}
+
+### TASK:
+Provide a detailed causal analysis answering the user's "why" question. Focus on explaining the reasons behind the observed trend or phenomenon.
+
+### GUIDELINES:
+1. Identify the key metrics that have changed between time periods
+2. Calculate the percentage changes for important metrics
+3. Look for patterns or anomalies that could explain the changes
+4. Consider multiple potential causes for the observed patterns
+5. Analyze both direct and indirect factors that might contribute
+6. Compare metrics across different dimensions (time, products, regions, etc.)
+7. Explain which factors appear most significant based on the data
+8. Be specific about the magnitude and direction of changes
+9. Use concrete numbers and percentages from the data to support your explanation
+10. Rank the likely causes in order of impact when possible
+11. Acknowledge limitations in the analysis if the data doesn't fully explain the trend
+
+### OUTPUT FORMAT:
+Provide a thorough analysis that directly answers why the observed trend is happening. Structure your response with clear sections covering different potential causes.
+"""
+        )
+        
+        # Create a temporary chain for the causal analysis
+        causal_chain = LLMChain(
+            llm=self.llm,
+            prompt=causal_analysis_prompt
+        )
+        
+        # Prepare params for analysis
+        params = {
+            "schema": self.schema_context,
+            "question": question,
+            "tables_info": tables_info_text
+        }
+        
+        # Add memory if enabled
+        if self.use_memory:
+            memory_context = self._prepare_memory_for_query(question) or ""
+            params["memory"] = memory_context
+        
+        # Generate the causal analysis
+        analysis_response = causal_chain.invoke(params)
+        
+        if isinstance(analysis_response, dict) and "text" in analysis_response:
+            analysis_text = analysis_response["text"].strip()
+            print("Causal analysis generated successfully")
+        else:
+            analysis_text = "Unable to generate causal analysis from the query results."
+            print("Failed to generate causal analysis")
+        
+        # Step 5: Store in memory and session context
+        if self.use_memory:
+            self._store_text_in_memory(question, analysis_text)
+            
+            for qr in query_results:
+                self._store_in_memory(
+                    f"Data for why analysis: {question} - {qr['query_name']}", 
+                    qr['sql'], 
+                    qr['results']
+                )
+        
+        # Store in session context for future reference
+        self.session_context["multi_query_results"] = query_results
+        self.session_context["text_responses"].append({
+            "question": question,
+            "text": analysis_text,
+            "timestamp": time.time()
+        })
+        
+        print(f"'Why' analysis completed in {time.time() - start_time:.2f} seconds")
+        
+        # Step 6: Return the full result with all tables
+        return {
+            "success": True,
+            "question": question,
+            "is_multi_query": True,
+            "is_why_analysis": True,
+            "tables": query_results,
+            "text": analysis_text,
+            "execution_time": time.time() - start_time
+        }
+    
+    def _extract_time_periods_from_question(self, question: str) -> List[Dict[str, str]]:
+        """
+        Extract time periods to analyze from the question
+        
+        Args:
+            question: The natural language question
+            
+        Returns:
+            List of time periods to analyze with name and description
+        """
+        question_lower = question.lower()
+        time_periods = []
+        
+        # Common time period patterns
+        period_patterns = {
+            "current_year": r"(this|current|present)\s+year",
+            "last_year": r"last\s+year|previous\s+year|year\s+ago",
+            "current_quarter": r"(this|current|present)\s+quarter",
+            "last_quarter": r"last\s+quarter|previous\s+quarter|quarter\s+ago",
+            "current_month": r"(this|current|present)\s+month",
+            "last_month": r"last\s+month|previous\s+month|month\s+ago"
+        }
+        
+        for period_id, pattern in period_patterns.items():
+            if re.search(pattern, question_lower):
+                if "current" in period_id or "this" in period_id:
+                    name = period_id.replace("_", " ").replace("current", "current").title()
+                    time_periods.append({
+                        "name": name,
+                        "description": f"Data for {name}"
+                    })
+                elif "last" in period_id or "previous" in period_id:
+                    name = period_id.replace("_", " ").replace("last", "previous").title()
+                    time_periods.append({
+                        "name": name,
+                        "description": f"Data for {name}"
+                    })
+        
+        # If we found specific periods, return them
+        if time_periods:
+            return time_periods
+            
+        # Default time periods if none were explicitly mentioned
+        return [
+            {"name": "Current Period", "description": "Most recent data"},
+            {"name": "Previous Period", "description": "Period before the most recent data"}
+        ]
+    
+    def _is_sql_question(self, question: str) -> bool:
+        """
+        Determine if a question requires SQL generation or is conversational
+        
+        Args:
+            question: The natural language question
+            
+        Returns:
+            True if the question likely requires SQL, False if it's conversational
+        """
+        # Keywords indicating SQL is needed
+        sql_keywords = [
+            "show me", "list", "find", "query", "select", "data", "database",
+            "table", "record", "rows", "search", "get", "fetch", "retrieve",
+            "count", "sum", "average", "total", "calculate", "analyze", "report",
+            "compare", "filter", "sort", "order", "group", "join", "where",
+            "how many", "which", "when", "sales", "customer", "order", "product"
+        ]
+        
+        # Keywords indicating conversation
+        conversation_keywords = [
+            "hello", "hi ", "hey", "thanks", "thank you", "help", "explain",
+            "what is", "how do", "why", "can you", "please", "would", "could",
+            "definition", "mean", "define"
+        ]
+        
+        # Question about the database structure
+        schema_keywords = [
+            "schema", "structure", "tables", "columns", "relationships", 
+            "foreign keys", "primary keys"
+        ]
+        
+        # Check for SQL-like patterns
+        question_lower = question.lower()
+        
+        # Direct check for schema queries
+        if any(keyword in question_lower for keyword in schema_keywords):
+            return False  # Schema questions can be answered conversationally
+            
+        # Check for conversation patterns
+        if any(keyword in question_lower for keyword in conversation_keywords):
+            # If it also has SQL keywords, it might be asking how to query something
+            if any(keyword in question_lower for keyword in sql_keywords):
+                # If it contains "how to" or similar, it's likely asking about SQL, not for SQL
+                return not any(phrase in question_lower for phrase in ["how to", "how do i", "how can i", "explain how"])
+            return False
+            
+        # Check for SQL patterns
+        if any(keyword in question_lower for keyword in sql_keywords):
+            return True
+            
+        # Default to conversational for ambiguous cases
+        return False
+
+    def plan_queries(self, question: str) -> Dict[str, Any]:
+        """
+        Plan the queries needed for a complex analysis question
+        
+        Args:
+            question: The natural language question
+            
+        Returns:
+            Dictionary with query planning details
+        """
+        # Prepare schema context if not already prepared
+        self._prepare_schema_context()
+        
+        # Default query plan to return in case of errors
+        default_plan = {
+            "is_multi_query": False,
+            "query_plan": [
+                {
+                    "query_name": "Default query",
+                    "description": "Single query to answer the question",
+                    "time_period": "current",
+                    "key_metrics": []
+                }
+            ],
+            "analysis_approach": "Direct single query approach"
+        }
+        
+        # Prepare params for query planning
+        params = {
+            "schema": self.schema_context,
+            "question": question
+        }
+        
+        # Add memory if enabled
+        if self.use_memory:
+            memory_context = self._prepare_memory_for_query(question) or ""
+            params["memory"] = memory_context
+        
+        try:
+            # Generate query plan
+            response = self.query_planner_chain.invoke(params)
+            
+            if isinstance(response, dict) and "text" in response:
+                response_text = response["text"].strip()
+                
+                # Parse the simple key-value format
+                needs_multiple = False
+                num_queries = 1
+                query_plan = []
+                analysis_approach = "Direct query approach"
+                
+                # Extract information using regex patterns
+                needs_multiple_match = re.search(r'NEEDS_MULTIPLE_QUERIES:\s*(yes|no|true|false)', response_text, re.IGNORECASE)
+                if needs_multiple_match:
+                    value = needs_multiple_match.group(1).lower()
+                    needs_multiple = value == "yes" or value == "true"
+                
+                num_queries_match = re.search(r'NUMBER_OF_QUERIES_NEEDED:\s*(\d+)', response_text, re.IGNORECASE)
+                if num_queries_match:
+                    try:
+                        num_queries = int(num_queries_match.group(1))
+                    except ValueError:
+                        num_queries = 1
+                
+                # Extract query descriptions
+                query_matches = re.findall(r'-\s*Query\s+\d+:\s*(.+?)(?=\n-|\nANALYSIS_APPROACH:|$)', response_text, re.DOTALL)
+                if query_matches:
+                    for i, description in enumerate(query_matches):
+                        query_plan.append({
+                            "query_name": f"Query {i+1}",
+                            "description": description.strip(),
+                            "time_period": "not specified",
+                            "key_metrics": []
+                        })
+                else:
+                    # Fallback to default query plan
+                    query_plan = default_plan["query_plan"]
+                
+                # Extract analysis approach
+                analysis_match = re.search(r'ANALYSIS_APPROACH:\s*(.+?)$', response_text, re.DOTALL)
+                if analysis_match:
+                    analysis_approach = analysis_match.group(1).strip()
+                
+                # Build the final query plan
+                result = {
+                    "is_multi_query": needs_multiple and num_queries > 1,
+                    "query_plan": query_plan,
+                    "analysis_approach": analysis_approach
+                }
+                
+                print("Query plan generated successfully")
+                return result
+            
+            print("No valid text in response, using default plan")
+            return default_plan
+                
+        except Exception as e:
+            print(f"Error planning queries: {e}")
+            return default_plan
+    
+    def generate_sql_for_subquery(self, question: str, query_info: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Generate SQL for a subquery in a multi-query plan
+        
+        Args:
+            question: The original question
+            query_info: Information about this specific query
+            
+        Returns:
+            Dictionary with SQL generation details
+        """
+        # Create a modified question that focuses on this specific subquery
+        query_name = query_info.get("query_name", "")
+        description = query_info.get("description", "")
+        time_period = query_info.get("time_period", "")
+        
+        # Construct a more specific question for this subquery
+        specific_question = f"For {query_name}: {description}"
+        if time_period:
+            specific_question += f" for {time_period}"
+        
+        # Add the original question for context
+        specific_question += f". This is part of answering: {question}"
+        
+        # Generate SQL for this specific question
+        return self.generate_sql(specific_question)
+    
+    def execute_multi_query_analysis(self, question: str, query_plan: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute multiple queries for complex analysis and provide a consolidated response
+        
+        Args:
+            question: The natural language question
+            query_plan: The query plan with multiple queries
+            
+        Returns:
+            Dictionary with execution results
+        """
+        start_time = time.time()
+        query_results = []
+        tables_info = []
+        
+        print(f"Starting multi-query analysis for: {question}")
+        print(f"Query plan has {len(query_plan.get('query_plan', []))} queries planned")
+        
+        # Step 1: Generate and execute all SQL queries
+        for i, query_info in enumerate(query_plan.get("query_plan", [])):
+            print(f"Processing query {i+1}: {query_info.get('query_name', f'Query {i+1}')}")
+            
+            # Generate SQL for this specific query
+            sql_generation = self.generate_sql_for_subquery(question, query_info)
+            
+            if not sql_generation["success"] or not sql_generation.get("sql"):
+                print(f"Failed to generate SQL for query {i+1}")
+                continue
+                
+            sql = sql_generation["sql"]
+            print(f"Generated SQL for query {i+1}: {sql[:100]}...")  # Print first 100 chars for debug
+            
+            # Execute the SQL
+            success, results, error = self.db_analyzer.execute_query(sql)
+            
+            if not success:
+                print(f"Error executing query {i+1}: {error}")
+                continue
+                
+            if not results or len(results) == 0:
+                print(f"Query {i+1} returned no results")
+                continue
+            
+            # Store the successful query and results
+            query_name = query_info.get("query_name", f"Query {i+1}")
+            query_results.append({
+                "query_name": query_name,
+                "sql": sql,
+                "results": results,
+                "row_count": len(results),
+                "description": query_info.get("description", "")
+            })
+            
+            print(f"Successfully executed query {i+1}, returned {len(results)} rows")
+        
+        # If no successful queries, return error
+        if not query_results:
+            print("No successful queries executed")
+            return {
+                "success": False,
+                "question": question,
+                "error": "Failed to execute any queries in the analysis plan",
+                "execution_time": time.time() - start_time
+            }
+        
+        # Step 2: Process and format each result table for the LLM, handling token limits
+        print("Preparing query results for analysis")
+        for qr in query_results:
+            results = qr["results"]
+            query_name = qr["query_name"]
+            
+            # Format the table with appropriate sampling if needed
+            if len(results) > 100:  # For large result sets
+                # Include statistics about the results
+                import pandas as pd
+                import numpy as np
+                
+                # Convert to DataFrame for easier analysis
+                df = pd.DataFrame(results)
+                
+                # Get basic statistics
+                stats = {}
+                numeric_cols = df.select_dtypes(include=[np.number]).columns
+                for col in numeric_cols:
+                    stats[col] = {
+                        "min": df[col].min() if not pd.isna(df[col].min()) else "N/A",
+                        "max": df[col].max() if not pd.isna(df[col].max()) else "N/A",
+                        "mean": df[col].mean() if not pd.isna(df[col].mean()) else "N/A",
+                        "median": df[col].median() if not pd.isna(df[col].median()) else "N/A"
+                    }
+                
+                # Sample rows for better representation
+                sampled_rows = []
+                
+                # First few rows
+                sampled_rows.extend(results[:20])
+                
+                # Last few rows
+                if len(results) > 40:
+                    sampled_rows.append({"note": "... skipping middle rows ..."})
+                    sampled_rows.extend(results[-20:])
+                
+                # Format for the LLM
+                table_formatted = (
+                    f"LARGE RESULT SET: {len(results)} rows total, showing first 20 and last 20 rows.\n\n"
+                    f"STATISTICS FOR NUMERIC COLUMNS:\n{json.dumps(stats, indent=2)}\n\n"
+                    f"SAMPLED ROWS:\n{self._format_results_for_display(sampled_rows)}"
+                )
+            else:
+                # For smaller result sets, include all rows
+                table_formatted = self._format_results_for_display(results)
+            
+            # Add formatted table to tables_info
+            tables_info.append(
+                f"### {query_name} ###\n"
+                f"DESCRIPTION: {qr.get('description', '')}\n"
+                f"SQL:\n```sql\n{qr['sql']}\n```\n\n"
+                f"RESULTS ({qr['row_count']} rows):\n{table_formatted}\n"
+            )
+        
+        # Step 3: Generate analysis from the combined results
+        print("Generating analysis from query results")
+        tables_info_text = "\n\n".join(tables_info)
+        
+        # Prepare params for analysis
+        params = {
+            "schema": self.schema_context,
+            "question": question,
+            "tables_info": tables_info_text
+        }
+        
+        # Add memory if enabled
+        if self.use_memory:
+            memory_context = self._prepare_memory_for_query(question) or ""
+            params["memory"] = memory_context
+        
+        # Generate the analysis
+        analysis_response = self.analysis_chain.invoke(params)
+        
+        if isinstance(analysis_response, dict) and "text" in analysis_response:
+            analysis_text = analysis_response["text"].strip()
+            print("Analysis generated successfully")
+        else:
+            analysis_text = "Unable to generate analysis from the query results."
+            print("Failed to generate analysis")
+        
+        # Step 4: Store in memory and session context
+        if self.use_memory:
+            # Store the analysis
+            self._store_text_in_memory(question, analysis_text)
+            
+            # Also store each individual query
+            for qr in query_results:
+                self._store_in_memory(
+                    f"Subquery for: {question} - {qr['query_name']}", 
+                    qr['sql'], 
+                    qr['results']
+                )
+        
+        # Store in session context for future reference
+        self.session_context["multi_query_results"] = query_results
+        self.session_context["text_responses"].append({
+            "question": question,
+            "text": analysis_text,
+            "timestamp": time.time()
+        })
+        
+        print(f"Multi-query analysis completed in {time.time() - start_time:.2f} seconds")
+        
+        # Step 5: Return the full result with all tables
+        return {
+            "success": True,
+            "question": question,
+            "is_multi_query": True,
+            "tables": query_results,
+            "text": analysis_text,
+            "execution_time": time.time() - start_time
+        }
+    
     def execute_query(self, question: str, auto_fix: bool = True, max_attempts: int = 2) -> Dict[str, Any]:
         """
         Generate SQL from a natural language question and execute it
@@ -763,10 +1823,42 @@ WHERE (
         Returns:
             Dictionary with execution results
         """
-        # Generate the SQL
+        # Check if this is a "why" question requiring specialized causal analysis
+        if self._is_why_question(question):
+            print("Detected 'why' question, using specialized causal analysis approach")
+            return self.handle_why_question(question)
+        
+        # Check if this is an analysis question requiring multiple queries
+        elif self._is_analysis_question(question):
+            # Plan the queries needed
+            query_plan = self.plan_queries(question)
+            
+            if query_plan.get("is_multi_query", False):
+                # Execute multi-query analysis
+                return self.execute_multi_query_analysis(question, query_plan)
+        
+        # Check if this is a conversational question not requiring SQL
+        # Use LLM-based classification instead of keyword matching
+        if self._is_conversational_question(question):
+            # Generate text response without SQL
+            text_result = self.generate_text_response(question)
+            return {
+                "success": True,
+                "question": question,
+                "sql": None,
+                "is_conversational": True,
+                "source": "ai",
+                "confidence": 90,
+                "results": None,
+                "text": text_result.get("text", "I couldn't generate a response.")
+            }
+
+        # Generate the SQL for a standard query
         generation_result = self.generate_sql(question)
         
         if not generation_result["success"] or not generation_result.get("sql"):
+            # Generate text response for the error case
+            text_result = self.generate_text_response(question)
             return {
                 "success": False,
                 "question": question,
@@ -775,7 +1867,8 @@ WHERE (
                 "confidence": generation_result.get("confidence", 0),
                 "error": generation_result.get("error", "Failed to generate SQL"),
                 "execution_time": generation_result.get("execution_time", 0),
-                "results": None
+                "results": None,
+                "text": text_result.get("text", "I couldn't generate SQL for your question.")
             }
         
         # Execute the SQL
@@ -802,6 +1895,34 @@ WHERE (
                 # If fixing failed, break the loop
                 break
         
+        # Handle pagination for large result sets
+        page_size = 10
+        total_rows = len(results) if results else 0
+        paginated_results = None
+        table_id = None
+        
+        if success and results and len(results) > page_size:
+            # Generate a unique table ID
+            import uuid
+            table_id = str(uuid.uuid4())
+            
+            # Store the full results for later pagination
+            self.paginated_results[table_id] = {
+                "question": question,
+                "sql": sql,
+                "results": results,
+                "total_rows": total_rows,
+                "timestamp": time.time()
+            }
+            
+            # Return only the first page
+            paginated_results = results[:page_size]
+        else:
+            paginated_results = results
+        
+        # Generate text response based on SQL and results
+        text_result = self.generate_text_response(question, sql, results if success else None)
+        
         # Store in memory if successful or even if failed (to remember errors too)
         if self.use_memory:
             self._store_in_memory(question, sql, results if success else None)
@@ -810,18 +1931,32 @@ WHERE (
             if success:
                 self._update_session_context(question, sql, results)
             
-        return {
+        response = {
             "success": success,
             "question": question,
             "sql": sql,
+            "is_conversational": False,
             "source": generation_result.get("source"),
             "confidence": generation_result.get("confidence"),
             "error": error,
             "auto_fixed": attempts > 0 and success,
             "fix_attempts": attempts,
             "execution_time": generation_result.get("execution_time", 0),
-            "results": results
+            "results": paginated_results,
+            "text": text_result.get("text", "")
         }
+        
+        # Add pagination metadata if applicable
+        if table_id:
+            response["pagination"] = {
+                "table_id": table_id,
+                "total_rows": total_rows,
+                "page_size": page_size,
+                "current_page": 1,
+                "total_pages": (total_rows + page_size - 1) // page_size
+            }
+        
+        return response
 
     def _update_session_context(self, question: str, sql: str, results: List[Dict]) -> None:
         """
@@ -1253,6 +2388,145 @@ WHERE (
                 print(f"Error preparing vector memory for query: {e}")
         
         return memory_context
+
+    def get_paginated_results(self, table_id: str, page: int = 1, page_size: int = 10) -> Dict[str, Any]:
+        """
+        Get a specific page of results for a previously executed query
+        
+        Args:
+            table_id: The unique ID of the stored result set
+            page: The page number to retrieve (1-indexed)
+            page_size: Number of rows per page
+            
+        Returns:
+            Dictionary with the requested page of results and pagination metadata
+        """
+        # Check if the table_id exists
+        if table_id not in self.paginated_results:
+            return {
+                "success": False,
+                "error": f"No results found for table_id: {table_id}",
+                "results": []
+            }
+            
+        # Get the stored results
+        stored_data = self.paginated_results[table_id]
+        results = stored_data["results"]
+        total_rows = len(results)
+        total_pages = (total_rows + page_size - 1) // page_size
+        
+        # Validate the page number
+        if page < 1:
+            page = 1
+        elif page > total_pages:
+            page = total_pages
+            
+        # Calculate start and end indices
+        start_idx = (page - 1) * page_size
+        end_idx = min(start_idx + page_size, total_rows)
+        
+        # Get the requested page of results
+        page_results = results[start_idx:end_idx]
+        
+        return {
+            "success": True,
+            "question": stored_data["question"],
+            "sql": stored_data["sql"],
+            "results": page_results,
+            "pagination": {
+                "table_id": table_id,
+                "total_rows": total_rows,
+                "page_size": page_size,
+                "current_page": page,
+                "total_pages": total_pages
+            }
+        }
+
+    def _is_conversational_question(self, question: str) -> bool:
+        """
+        Use the LLM to determine if a question is conversational rather than requiring SQL
+        
+        Args:
+            question: The natural language question
+            
+        Returns:
+            True if the question is conversational, False if it likely requires SQL
+        """
+        # Prepare schema context if not already prepared
+        self._prepare_schema_context()
+        
+        # Define a prompt template for determining if a question is conversational
+        conversation_classifier_prompt = PromptTemplate(
+            input_variables=["schema", "question"],
+            template="""You are an expert at classifying database questions. Your task is to determine if a question requires SQL generation or if it's a conversational question that should be answered directly.
+
+### DATABASE SCHEMA:
+{schema}
+
+### USER QUESTION:
+"{question}"
+
+### TASK:
+Determine if this question requires generating SQL to query the database, or if it's a conversational question that should be answered directly.
+
+Examples of SQL questions:
+- "Show me the top 5 customers by sales"
+- "List all orders from January 2023"
+- "What was the total revenue last quarter?"
+- "How many products are in each category?"
+
+Examples of conversational questions:
+- "What is a database index?"
+- "How do I optimize SQL queries?"
+- "Tell me about your capabilities"
+- "What LLM are you using?"
+- "How does this system work?"
+- "What programming language is this built with?"
+- "Can you explain what a foreign key is?"
+
+### CLASSIFICATION:
+Provide ONLY ONE of the following responses:
+SQL_QUESTION - if the question requires database querying
+CONVERSATIONAL - if the question is asking for information, explanation, or conversation
+
+"""
+        )
+        
+        # Create a temporary chain for classification
+        conversation_classifier_chain = LLMChain(
+            llm=self.llm,
+            prompt=conversation_classifier_prompt
+        )
+        
+        try:
+            # Prepare params for classification
+            params = {
+                "schema": self.schema_context,
+                "question": question
+            }
+            
+            # Generate classification
+            response = conversation_classifier_chain.invoke(params)
+            
+            if isinstance(response, dict) and "text" in response:
+                classification = response["text"].strip().upper()
+                
+                # Check for conversational classification
+                if "CONVERSATIONAL" in classification:
+                    print(f"LLM classified question as conversational: {question}")
+                    return True
+                else:
+                    print(f"LLM classified question as requiring SQL: {question}")
+                    return False
+            
+            # Default to the keyword-based approach if LLM classification fails
+            print("LLM classification failed, falling back to keyword-based approach")
+            return not self._is_sql_question(question)
+            
+        except Exception as e:
+            print(f"Error in conversational classification: {e}")
+            # Fall back to the keyword-based approach
+            return not self._is_sql_question(question)
 
 
 if __name__ == "__main__":
