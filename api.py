@@ -647,64 +647,6 @@ async def query_with_session(
     else:
         sql_generator = active_generators[session_id]
     
-<<<<<<< HEAD
-=======
-    except Exception as e:
-        import traceback
-        error_trace = traceback.format_exc()
-        print(f"Session creation error: {str(e)}\n{error_trace}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create session: {str(e)}"
-        )
-
-
-@app.get("/sessions/{session_id}")
-def get_session_info(session_id: str):
-    """Get information about a session"""
-    if session_id not in active_sessions:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found or expired"
-        )
-    
-    session_data = active_sessions[session_id]
-    
-    # Update last access time
-    session_data["last_access"] = datetime.now()
-    
-    # Calculate remaining time
-    elapsed = datetime.now() - session_data["last_access"]
-    remaining_minutes = SESSION_TIMEOUT - int(elapsed.total_seconds() / 60)
-    
-    return {
-        "session_id": session_id,
-        "created_at": session_data["created_at"].isoformat(),
-        "last_access": session_data["last_access"].isoformat(),
-        "db_info": session_data["db_info"],
-        "expires_in_minutes": max(0, remaining_minutes)
-    }
-
-
-@app.delete("/sessions/{session_id}")
-def delete_session(session_id: str):
-    """Delete a session"""
-    if session_id not in active_sessions:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found or expired"
-        )
-    
-    # Delete the session
-    del active_sessions[session_id]
-    
-    return {"message": f"Session {session_id} deleted successfully"}
-
-
-@app.post("/query")
-def query_without_session(query_req: QueryRequest):
-    """Process a query without a session - creates temporary session"""
->>>>>>> 43ccfc94c426ddc1f708e39297b6f8184ed2ac5a
     try:
         # Create the user message
         user_message = await MessageService.create_message(
