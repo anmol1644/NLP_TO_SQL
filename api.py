@@ -4,6 +4,8 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 from decimal import Decimal
 import json
+import time
+from bson import ObjectId
 
 import uvicorn
 from fastapi import FastAPI, Depends, HTTPException, status, Header, Request, Body
@@ -44,10 +46,18 @@ app = FastAPI(
 # Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update with your frontend domains in production
+    allow_origins=[
+        "http://localhost:3000",  # Next.js dev server
+        "http://127.0.0.1:3000",
+        "http://localhost",
+        "http://localhost:8080",
+        "https://yourproductiondomain.com",  # Add your production domain when ready
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"],
+    expose_headers=["Content-Length", "Content-Range"],
+    max_age=3600,  # Cache preflight requests for 1 hour
 )
 
 # Active SQL generators for each session
@@ -174,27 +184,23 @@ async def get_current_user_info(current_user: User = Depends(get_current_active_
 
 # Workspace endpoints
 @app.post("/workspaces", response_model=Workspace, status_code=status.HTTP_201_CREATED)
-async def create_workspace(
-    workspace: WorkspaceCreate,
-    current_user: User = Depends(get_current_active_user)
-):
+async def create_workspace(workspace: WorkspaceCreate):
     """Create a new workspace"""
-    return await WorkspaceService.create_workspace(workspace, current_user.id)
+    # Default to public user ID
+    user_id = ObjectId()
+    return await WorkspaceService.create_workspace(workspace, user_id)
 
 
 @app.get("/workspaces", response_model=List[Workspace])
-async def get_user_workspaces(current_user: User = Depends(get_current_active_user)):
+async def get_user_workspaces():
     """Get all workspaces for the current user"""
-    return await WorkspaceService.get_user_workspaces(current_user.id)
+    return await WorkspaceService.get_all_workspaces()
 
 
 @app.get("/workspaces/{workspace_id}", response_model=Workspace)
-async def get_workspace(
-    workspace_id: str,
-    current_user: User = Depends(get_current_active_user)
-):
+async def get_workspace(workspace_id: str):
     """Get a workspace by ID"""
-    workspace = await WorkspaceService.get_workspace(workspace_id, current_user.id)
+    workspace = await WorkspaceService.get_workspace_by_id(workspace_id)
     
     if not workspace:
         raise HTTPException(
@@ -208,12 +214,11 @@ async def get_workspace(
 @app.put("/workspaces/{workspace_id}", response_model=Workspace)
 async def update_workspace(
     workspace_id: str,
-    workspace_data: Dict[str, Any] = Body(...),
-    current_user: User = Depends(get_current_active_user)
+    workspace_data: Dict[str, Any] = Body(...)
 ):
     """Update a workspace"""
-    workspace = await WorkspaceService.update_workspace(
-        workspace_id, current_user.id, workspace_data
+    workspace = await WorkspaceService.update_workspace_by_id(
+        workspace_id, workspace_data
     )
     
     if not workspace:
@@ -226,213 +231,196 @@ async def update_workspace(
 
 
 @app.delete("/workspaces/{workspace_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_workspace(
-    workspace_id: str,
-    current_user: User = Depends(get_current_active_user)
-):
+async def delete_workspace(workspace_id: str):
     """Delete a workspace"""
-    success = await WorkspaceService.delete_workspace(workspace_id, current_user.id)
+    deleted = await WorkspaceService.delete_workspace_by_id(workspace_id)
     
-    if not success:
+    if not deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Workspace not found"
         )
-    
-    # Close connection pool and remove from active workspaces
-    db_connection_manager.close_workspace_pool(workspace_id)
-    if workspace_id in active_workspaces:
-        del active_workspaces[workspace_id]
-    
-    return None
 
 
 @app.post("/workspaces/{workspace_id}/activate")
-async def activate_workspace(
-    workspace_id: str,
-    current_user: User = Depends(get_current_active_user)
-):
-    """Activate a workspace by connecting to its database"""
-    # Get the workspace
-    workspace = await WorkspaceService.get_workspace(workspace_id, current_user.id)
-    
-    if not workspace:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Workspace not found"
-        )
-    
-    db_conn = workspace.db_connection
-    
+async def activate_workspace(workspace_id: str):
+    """Activate a workspace by establishing a database connection"""
     try:
-        # Create database configuration for connection manager
-        db_config = {
-            'host': db_conn.host,
-            'port': db_conn.port,
-            'db_name': db_conn.db_name,
-            'username': db_conn.username,
-            'password': db_conn.password
-        }
+        workspace = await WorkspaceService.get_workspace_by_id(workspace_id)
         
-        # Create connection pool for this workspace
-        pool_created = db_connection_manager.create_workspace_pool(workspace_id, db_config)
-        
-        if not pool_created:
+        if not workspace:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to create database connection pool"
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Workspace not found"
             )
         
-        # Get the database analyzer from connection manager (already created with schema analyzed)
-        db_analyzer = db_connection_manager.get_database_analyzer(workspace_id)
+        db_conn = workspace.db_connection
         
-        # Get table count from the analyzed schema
-        table_count = 0
-        if db_analyzer and db_analyzer.schema_info and "tables" in db_analyzer.schema_info:
-            table_count = len(db_analyzer.schema_info["tables"])
-        
-        # Store the active workspace connection info
-        active_workspaces[workspace_id] = {
-            "status": "connected",
-            "connected_at": datetime.utcnow().isoformat(),
-            "user_id": current_user.id,
-            "database_info": {
-                "name": db_conn.db_name,
-                "host": db_conn.host,
-                "port": db_conn.port,
-                "table_count": table_count
-            },
-            "db_analyzer": db_analyzer
-        }
-        
-        return {
-            "success": True,
-            "message": f"Successfully connected to database '{db_conn.db_name}'",
-            "workspace_id": workspace_id,
-            "database_info": {
-                "name": db_conn.db_name,
-                "host": db_conn.host,
-                "port": db_conn.port,
-                "table_count": table_count,
-                "status": "connected"
+        try:
+            # Create database configuration for connection manager
+            db_config = {
+                'host': db_conn.host,
+                'port': db_conn.port,
+                'db_name': db_conn.db_name,
+                'username': db_conn.username,
+                'password': db_conn.password
             }
-        }
-        
-    except OperationalError as e:
-        error_msg = str(e).strip()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to connect to database: {error_msg}"
-        )
+            
+            # Create connection pool for this workspace
+            pool_created = db_connection_manager.create_workspace_pool(workspace_id, db_config)
+            
+            if not pool_created:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Failed to create database connection pool"
+                )
+            
+            # Get the database analyzer from connection manager (already created with schema analyzed)
+            db_analyzer = db_connection_manager.get_database_analyzer(workspace_id)
+            
+            # Get table count from the analyzed schema
+            table_count = 0
+            if db_analyzer and db_analyzer.schema_info and "tables" in db_analyzer.schema_info:
+                table_count = len(db_analyzer.schema_info["tables"])
+            
+            # Store the active workspace connection info
+            active_workspaces[workspace_id] = {
+                "status": "connected",
+                "connected_at": datetime.utcnow().isoformat(),
+                "user_id": workspace.user_id,
+                "database_info": {
+                    "name": db_conn.db_name,
+                    "host": db_conn.host,
+                    "port": db_conn.port,
+                    "table_count": table_count
+                },
+                "db_analyzer": db_analyzer
+            }
+            
+            return {
+                "success": True,
+                "message": f"Successfully connected to database '{db_conn.db_name}'",
+                "workspace_id": workspace_id,
+                "database_info": {
+                    "name": db_conn.db_name,
+                    "host": db_conn.host,
+                    "port": db_conn.port,
+                    "table_count": table_count,
+                    "status": "connected"
+                }
+            }
+            
+        except OperationalError as e:
+            error_msg = str(e).strip()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to connect to database: {error_msg}"
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Database connection error: {str(e)}"
+            )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database connection error: {str(e)}"
+            detail=f"Workspace activation error: {str(e)}"
         )
 
 
 @app.post("/workspaces/{workspace_id}/deactivate")
-async def deactivate_workspace(
-    workspace_id: str,
-    current_user: User = Depends(get_current_active_user)
-):
-    """Deactivate a workspace by disconnecting from its database"""
-    # Check if workspace exists and belongs to user
-    workspace = await WorkspaceService.get_workspace(workspace_id, current_user.id)
-    
-    if not workspace:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Workspace not found"
-        )
-    
-    # Close the connection pool
-    pool_closed = db_connection_manager.close_workspace_pool(workspace_id)
-    
-    # Remove from active workspaces
-    if workspace_id in active_workspaces:
+async def deactivate_workspace(workspace_id: str):
+    """Deactivate a workspace by closing its database connection"""
+    try:
+        # Check if workspace exists
+        workspace = await WorkspaceService.get_workspace_by_id(workspace_id)
+        
+        if not workspace:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Workspace not found"
+            )
+        
+        # Check if workspace is active
+        if workspace_id not in active_workspaces:
+            return {
+                "success": True,
+                "message": f"Workspace {workspace_id} is already inactive",
+                "workspace_id": workspace_id
+            }
+        
+        # Close connection pool
+        db_connection_manager.close_workspace_pool(workspace_id)
+        
+        # Remove from active workspaces
         del active_workspaces[workspace_id]
-    
-    return {
-        "success": True,
-        "message": "Workspace deactivated successfully",
-        "workspace_id": workspace_id,
-        "status": "disconnected",
-        "pool_closed": pool_closed
-    }
+        
+        return {
+            "success": True,
+            "message": f"Successfully deactivated workspace {workspace_id}",
+            "workspace_id": workspace_id
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Workspace deactivation error: {str(e)}"
+        )
 
 
 @app.get("/workspaces/{workspace_id}/status")
-async def get_workspace_status(
-    workspace_id: str,
-    current_user: User = Depends(get_current_active_user)
-):
+async def get_workspace_status(workspace_id: str):
     """Get the connection status of a workspace"""
-    # Check if workspace exists and belongs to user
-    workspace = await WorkspaceService.get_workspace(workspace_id, current_user.id)
-    
-    if not workspace:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Workspace not found"
-        )
-    
-    # Check connection manager status first
-    pool_status = db_connection_manager.get_workspace_status(workspace_id)
-    
-    if pool_status:
-        return pool_status
-    else:
-        return {
-            "workspace_id": workspace_id,
-            "status": "disconnected",
-            "database_info": {
-                "name": workspace.db_connection.db_name,
-                "host": workspace.db_connection.host,
-                "port": workspace.db_connection.port,
-                "status": "disconnected"
+    try:
+        # Check if workspace exists
+        workspace = await WorkspaceService.get_workspace_by_id(workspace_id)
+        
+        if not workspace:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Workspace not found"
+            )
+        
+        # Check if workspace is active
+        if workspace_id in active_workspaces:
+            status_info = active_workspaces[workspace_id]
+            return {
+                "status": status_info["status"],
+                "connected_at": status_info["connected_at"],
+                "database_info": status_info["database_info"]
             }
-        }
+        else:
+            return {
+                "status": "disconnected",
+                "database_info": {
+                    "name": workspace.db_connection.db_name,
+                    "host": workspace.db_connection.host,
+                    "port": workspace.db_connection.port
+                }
+            }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error getting workspace status: {str(e)}"
+        )
 
 
 # Session endpoints
 @app.post("/workspaces/{workspace_id}/sessions", response_model=Session, status_code=status.HTTP_201_CREATED)
-async def create_session(
-    workspace_id: str,
-    session: SessionCreate,
-    current_user: User = Depends(get_current_active_user)
-):
+async def create_session(workspace_id: str, session: SessionCreate):
     """Create a new session in a workspace"""
-    # Make sure the session has the correct workspace_id
-    session_data = session.dict()
-    session_data["workspace_id"] = workspace_id
-    session = SessionCreate(**session_data)
-    
-    try:
-        return await SessionService.create_session(session, current_user.id)
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
+    return await SessionService.create_session(session, workspace_id)
 
 
 @app.get("/workspaces/{workspace_id}/sessions", response_model=List[Session])
-async def get_workspace_sessions(
-    workspace_id: str,
-    current_user: User = Depends(get_current_active_user)
-):
-    """Get all sessions for a workspace"""
-    return await SessionService.get_workspace_sessions(workspace_id, current_user.id)
+async def get_workspace_sessions(workspace_id: str):
+    """Get all sessions in a workspace"""
+    return await SessionService.get_workspace_sessions(workspace_id)
 
 
 @app.get("/sessions/{session_id}", response_model=Session)
-async def get_session(
-    session_id: str,
-    current_user: User = Depends(get_current_active_user)
-):
+async def get_session(session_id: str):
     """Get a session by ID"""
-    session = await SessionService.get_session(session_id, current_user.id)
+    session = await SessionService.get_session(session_id)
     
     if not session:
         raise HTTPException(
@@ -444,12 +432,9 @@ async def get_session(
 
 
 @app.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_session(
-    session_id: str,
-    current_user: User = Depends(get_current_active_user)
-):
+async def delete_session(session_id: str):
     """Delete a session"""
-    success = await SessionService.delete_session(session_id, current_user.id)
+    success = await SessionService.delete_session(session_id)
     
     if not success:
         raise HTTPException(
@@ -457,7 +442,7 @@ async def delete_session(
             detail="Session not found"
         )
     
-    # Clean up any active generator
+    # Clean up the generator for this session
     if session_id in active_generators:
         del active_generators[session_id]
     
@@ -466,22 +451,15 @@ async def delete_session(
 
 # Message endpoints
 @app.get("/sessions/{session_id}/messages", response_model=List[Message])
-async def get_session_messages(
-    session_id: str,
-    current_user: User = Depends(get_current_active_user)
-):
-    """Get all messages for a session including complete query results"""
-    return await MessageService.get_session_messages(session_id, current_user.id)
+async def get_session_messages(session_id: str):
+    """Get all messages in a session"""
+    return await MessageService.get_session_messages(session_id)
 
 
 @app.get("/messages/{message_id}/query-result")
-async def get_message_query_result(
-    message_id: str,
-    current_user: User = Depends(get_current_active_user)
-):
-    """Get the complete query result for a specific message"""
-    # Get the message
-    message = await MessageService.get_message(message_id, current_user.id)
+async def get_message_query_result(message_id: str):
+    """Get the query result for a message"""
+    message = await MessageService.get_message(message_id)
     
     if not message:
         raise HTTPException(
@@ -492,22 +470,16 @@ async def get_message_query_result(
     if not message.query_result:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="No query result available for this message"
+            detail="No query result for this message"
         )
     
     return message.query_result
 
 
 @app.get("/messages/{message_id}/results")
-async def get_message_results(
-    message_id: str,
-    page: int = 1,
-    page_size: int = 10,
-    current_user: User = Depends(get_current_active_user)
-):
-    """Get paginated results for a message's query result"""
-    # Get the message
-    message = await MessageService.get_message(message_id, current_user.id)
+async def get_message_results(message_id: str, page: int = 1, page_size: int = 10):
+    """Get paginated results for a message's query"""
+    message = await MessageService.get_message(message_id)
     
     if not message:
         raise HTTPException(
@@ -518,56 +490,50 @@ async def get_message_results(
     if not message.query_result or not message.query_result.results:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="No query results available for this message"
+            detail="No results for this message"
         )
     
-    # Paginate the results
-    results = message.query_result.results
-    total_rows = len(results)
+    # Calculate pagination
+    all_results = message.query_result.results
+    total_rows = len(all_results)
     total_pages = (total_rows + page_size - 1) // page_size
     
-    # Validate page number
+    # Adjust page if out of range
     if page < 1:
         page = 1
-    elif page > total_pages:
+    elif page > total_pages and total_pages > 0:
         page = total_pages
     
-    # Calculate start and end indices
+    # Get slice of results for the requested page
     start_idx = (page - 1) * page_size
     end_idx = min(start_idx + page_size, total_rows)
     
-    # Get the requested page of results
-    page_results = results[start_idx:end_idx]
+    page_results = all_results[start_idx:end_idx]
+    
+    # Create pagination info
+    pagination = {
+        "current_page": page,
+        "total_pages": total_pages,
+        "total_rows": total_rows,
+        "page_size": page_size,
+        "has_next": page < total_pages,
+        "has_prev": page > 1
+    }
     
     return {
-        "success": True,
-        "message_id": message_id,
-        "sql": message.query_result.sql,
-        "results": page_results,
-        "pagination": {
-            "total_rows": total_rows,
-            "page_size": page_size,
-            "current_page": page,
-            "total_pages": total_pages
-        },
-        "query_metadata": {
-            "execution_time": message.query_result.execution_time,
-            "query_type": message.query_result.query_type,
-            "is_multi_query": message.query_result.is_multi_query,
-            "auto_fixed": message.query_result.auto_fixed
-        }
+        "pagination": pagination,
+        "data": page_results
     }
 
 
 @app.post("/sessions/{session_id}/query")
 async def query_with_session(
     session_id: str, 
-    query_req: QueryRequest,
-    current_user: User = Depends(get_current_active_user)
+    query_req: QueryRequest
 ):
-    """Process a query within a session"""
-    # Get the session
-    session = await SessionService.get_session(session_id, current_user.id)
+    """Execute a query using an existing session"""
+    # Get session first
+    session = await SessionService.get_session(session_id)
     
     if not session:
         raise HTTPException(
@@ -575,8 +541,9 @@ async def query_with_session(
             detail="Session not found"
         )
     
-    # Get the workspace
-    workspace = await WorkspaceService.get_workspace(session.workspace_id, current_user.id)
+    # Get workspace info
+    workspace_id = session.workspace_id
+    workspace = await WorkspaceService.get_workspace_by_id(workspace_id)
     
     if not workspace:
         raise HTTPException(
@@ -584,133 +551,99 @@ async def query_with_session(
             detail="Workspace not found"
         )
     
-    # Initialize or get the SQL generator for this session
-    if session_id not in active_generators:
-        # Try to get database analyzer from connection manager first
-        db_analyzer = db_connection_manager.get_database_analyzer(session.workspace_id)
-        
-        # Ensure schema is analyzed if we have a database analyzer
-        if db_analyzer:
-            db_connection_manager.ensure_schema_analyzed(session.workspace_id)
+    # Check if workspace is active and has a connection
+    if workspace_id not in active_workspaces:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Workspace {workspace_id} is not active. Please activate it first."
+        )
+    
+    # Get or create SQL generator for this session
+    if session_id in active_generators:
+        sql_generator = active_generators[session_id]
+    else:
+        # Create a new SQL generator for this session
+        db_analyzer = active_workspaces[workspace_id].get("db_analyzer")
         
         if not db_analyzer:
-            # Check if workspace has a connection pool but no analyzer
-            pool_status = db_connection_manager.get_workspace_status(session.workspace_id)
-            
-            if pool_status:
-                # This shouldn't happen, but handle it gracefully
-                db_analyzer = db_connection_manager.get_database_analyzer(session.workspace_id)
-            elif session.workspace_id in active_workspaces:
-                # Use the existing database analyzer from active workspace (fallback)
-                db_analyzer = active_workspaces[session.workspace_id]["db_analyzer"]
-            else:
-                # Create connection pool if it doesn't exist
-                db_conn = workspace.db_connection
-                db_config = {
-                    'host': db_conn.host,
-                    'port': db_conn.port,
-                    'db_name': db_conn.db_name,
-                    'username': db_conn.username,
-                    'password': db_conn.password
-                }
-                
-                pool_created = db_connection_manager.create_workspace_pool(session.workspace_id, db_config, analyze_schema=True)
-                
-                if pool_created:
-                    # Get the analyzer from the connection manager
-                    db_analyzer = db_connection_manager.get_database_analyzer(session.workspace_id)
-                else:
-                    # Fallback to direct connection
-                    db_analyzer = DatabaseAnalyzer(
-                        db_conn.db_name,
-                        db_conn.username,
-                        db_conn.password,
-                        db_conn.host,
-                        db_conn.port
-                    )
-                    # Analyze schema for fallback case
-                    db_analyzer.analyze_schema()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Database analyzer not found for this workspace"
+            )
         
-        # Create a memory directory specific to this session
-        memory_dir = f"./vector_stores/{session.vector_store_id}"
-        os.makedirs(memory_dir, exist_ok=True)
-        
-        # Initialize SQL generator
         sql_generator = SmartSQLGenerator(
-            db_analyzer,
-            use_cache=True,
+            db_analyzer=db_analyzer,
             use_memory=True,
-            memory_persist_dir=memory_dir
+            use_cache=True,
+            memory_persist_dir=f"./memory_store/{session_id}"
         )
-        
         active_generators[session_id] = sql_generator
-    else:
-        sql_generator = active_generators[session_id]
+    
+    # Create user message
+    user_message = MessageCreate(
+        content=query_req.question,
+        role="user",
+        session_id=session_id
+    )
+    user_message = await MessageService.create_message(user_message, session.user_id)
+    
+    # Execute query
+    start_time = time.time()
+    auto_fix = query_req.auto_fix if hasattr(query_req, 'auto_fix') else True
+    max_attempts = query_req.max_attempts if hasattr(query_req, 'max_attempts') else 2
     
     try:
-        # Create the user message
-        user_message = await MessageService.create_message(
-            MessageCreate(
-                content=query_req.question,
-                role="user",
-                session_id=session_id
-            ),
-            current_user.id
+        query_result = sql_generator.execute_query(
+            query_req.question, 
+            auto_fix=auto_fix,
+            max_attempts=max_attempts
         )
         
-        # Execute the query
-        result = sql_generator.execute_query(
-            query_req.question,
-            auto_fix=query_req.auto_fix,
-            max_attempts=query_req.max_attempts
+        # Update query_result with additional metadata
+        execution_time = time.time() - start_time
+        query_result["execution_time"] = execution_time
+        
+        # Create assistant message with query result
+        assistant_message = MessageCreate(
+            content=query_result.get("text", "Query executed"),
+            role="assistant",
+            session_id=session_id,
+            query_result=query_result
         )
-        
-        # Convert any Decimal objects to float for MongoDB compatibility
-        converted_result = convert_decimals_to_float(result)
-        
-        # Create QueryResult object from the execution result
-        query_result = QueryResult(
-            success=converted_result.get("success", False),
-            sql=converted_result.get("sql"),
-            results=converted_result.get("results"),
-            error=converted_result.get("error"),
-            execution_time=converted_result.get("execution_time"),
-            is_conversational=converted_result.get("is_conversational"),
-            is_multi_query=converted_result.get("is_multi_query"),
-            is_why_analysis=converted_result.get("is_why_analysis"),
-            query_type=converted_result.get("query_type"),
-            analysis_type=converted_result.get("analysis_type"),
-            source=converted_result.get("source"),
-            confidence=converted_result.get("confidence"),
-            auto_fixed=converted_result.get("auto_fixed"),
-            fix_attempts=converted_result.get("fix_attempts"),
-            pagination=converted_result.get("pagination"),
-            tables=converted_result.get("tables")
-        )
-        
-        # Create the assistant message with complete query result
         assistant_message = await MessageService.create_message(
-            MessageCreate(
-                content=converted_result.get("text", "I couldn't generate a response."),
-                role="assistant",
-                session_id=session_id,
-                query_result=query_result
-            ),
-            current_user.id
+            assistant_message, session.user_id
         )
         
         # Format the response
-        response = format_query_result(converted_result)
-        response["user_message"] = user_message
-        response["assistant_message"] = assistant_message
+        response = format_query_result(query_result)
+        
+        # Add session and message IDs to response
+        response["session_id"] = session_id
+        response["message_id"] = str(assistant_message.id)
         
         return response
         
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Query execution failed: {str(e)}"
+        # Handle error and create error message
+        error_message = f"Error executing query: {str(e)}"
+        error_result = {
+            "success": False,
+            "error": str(e),
+            "text": error_message,
+            "execution_time": time.time() - start_time
+        }
+        
+        # Create assistant message with error info
+        error_assistant_message = MessageCreate(
+            content=error_message,
+            role="assistant",
+            session_id=session_id,
+            query_result=error_result
         )
+        await MessageService.create_message(error_assistant_message, session.user_id)
+        
+        # Return error result
+        return error_result
 
 
 def format_query_result(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -774,12 +707,11 @@ async def get_paginated_results(
     session_id: str,
     table_id: str,
     page: int = 1,
-    page_size: int = 10,
-    current_user: User = Depends(get_current_active_user)
+    page_size: int = 10
 ):
-    """Get paginated results for a query"""
-    # Check if the session exists and belongs to the user
-    session = await SessionService.get_session(session_id, current_user.id)
+    """Get paginated results for a table in a session"""
+    # Get session first
+    session = await SessionService.get_session(session_id)
     
     if not session:
         raise HTTPException(
@@ -787,50 +719,32 @@ async def get_paginated_results(
             detail="Session not found"
         )
     
-    # Check if the SQL generator exists for this session
-    if session_id not in active_generators:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No active SQL generator for this session"
-        )
+    # Get the SQL generator for this session
+    sql_generator = get_sql_generator(session_id)
     
-    sql_generator = active_generators[session_id]
-    
+    # Get the results for the specified table and page
     try:
-        # Get the paginated results
-        result = sql_generator.get_paginated_results(table_id, page, page_size)
-        
-        if not result["success"]:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=result.get("error", "Table not found")
-            )
-        
-        # Format the response
-        return format_query_result(result)
-    
+        results = sql_generator.get_paginated_results(table_id, page, page_size)
+        return results
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve paginated results: {str(e)}"
+            detail=f"Error fetching paginated results: {str(e)}"
         )
 
 
-# Add connection pool monitoring endpoint
+# Workspace connection pool endpoint
 @app.get("/admin/connection-pools")
-async def get_all_connection_pools(current_user: User = Depends(get_current_active_user)):
-    """Get status of all active connection pools (admin endpoint)"""
-    return db_connection_manager.get_all_workspace_status()
+async def get_all_connection_pools():
+    """Get information about all database connection pools"""
+    return db_connection_manager.get_all_pools_info()
 
 
 @app.post("/workspaces/{workspace_id}/refresh-schema")
-async def refresh_workspace_schema(
-    workspace_id: str,
-    current_user: User = Depends(get_current_active_user)
-):
-    """Refresh the database schema analysis for a workspace"""
-    # Check if workspace exists and belongs to user
-    workspace = await WorkspaceService.get_workspace(workspace_id, current_user.id)
+async def refresh_workspace_schema(workspace_id: str):
+    """Refresh the database schema for a workspace"""
+    # Check if workspace exists
+    workspace = await WorkspaceService.get_workspace_by_id(workspace_id)
     
     if not workspace:
         raise HTTPException(
@@ -838,39 +752,39 @@ async def refresh_workspace_schema(
             detail="Workspace not found"
         )
     
-    # Check if workspace has an active connection pool
-    db_analyzer = db_connection_manager.get_database_analyzer(workspace_id)
-    
-    if not db_analyzer:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Workspace is not currently active. Please activate it first."
-        )
-    
     try:
-        # Force re-analysis by clearing the analyzed flag and re-analyzing
-        with db_connection_manager._lock:
-            if workspace_id in db_connection_manager.workspace_pools:
-                db_connection_manager.workspace_pools[workspace_id]['schema_analyzed'] = False
-        
-        # Trigger schema analysis
-        schema_analyzed = db_connection_manager.ensure_schema_analyzed(workspace_id)
-        
-        if schema_analyzed:
-            # Get updated status
-            status_info = db_connection_manager.get_workspace_status(workspace_id)
-            return {
-                "success": True,
-                "message": "Schema analysis refreshed successfully",
-                "workspace_id": workspace_id,
-                "status": status_info
-            }
-        else:
+        # Check if workspace is active
+        if workspace_id not in active_workspaces:
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to refresh schema analysis"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Workspace {workspace_id} is not active. Please activate it first."
             )
-    
+        
+        # Get the database analyzer and refresh schema
+        db_analyzer = active_workspaces[workspace_id].get("db_analyzer")
+        
+        if not db_analyzer:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Database analyzer not found for workspace {workspace_id}"
+            )
+        
+        # Refresh schema
+        schema_info = db_analyzer.analyze_schema(force_refresh=True)
+        
+        # Calculate some summary info
+        table_count = len(schema_info.get("tables", {}))
+        relationship_count = len(schema_info.get("relationships", []))
+        
+        return {
+            "success": True,
+            "message": f"Schema refreshed successfully. Found {table_count} tables and {relationship_count} relationships.",
+            "workspace_id": workspace_id,
+            "tables_count": table_count,
+            "relationships_count": relationship_count,
+            "refreshed_at": datetime.utcnow().isoformat()
+        }
+        
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

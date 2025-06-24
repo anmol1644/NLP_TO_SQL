@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { X, Database, Check, AlertCircle, Loader2 } from 'lucide-react';
-import { createSession, SessionRequest } from '../lib/api';
+import { X, Database, AlertCircle, Loader2 } from 'lucide-react';
+import axios from 'axios';
 
 interface SessionManagerProps {
   onSessionCreated: (sessionId: string) => void;
@@ -8,17 +8,28 @@ interface SessionManagerProps {
   onClose: () => void;
 }
 
+// Define the session request interface
+interface SessionRequest {
+  db_name: string;
+  username: string;
+  password: string;
+  host: string;
+  port: string;
+  use_memory: boolean;
+  use_cache: boolean;
+}
+
 export default function SessionManager({ onSessionCreated, isOpen, onClose }: SessionManagerProps) {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [formData, setFormData] = useState<SessionRequest>({
-    db_name: 'AdventureWorks',
+    db_name: 'Adventureworks',
     username: 'postgres',
     password: 'anmol',
     host: 'localhost',
     port: '5432',
     use_memory: true,
-    use_cache: true
+    use_cache: true,
   });
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -34,12 +45,103 @@ export default function SessionManager({ onSessionCreated, isOpen, onClose }: Se
     setIsLoading(true);
     setError(null);
 
+    // API base URL
+    const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+
     try {
-      const response = await createSession(formData);
-      onSessionCreated(response.session_id);
+      // Get auth headers
+      const token = localStorage.getItem('auth_token');
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+      };
+      
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+
+      // Try to create a session directly first
+      try {
+        const directSessionResponse = await axios.post(
+          `${API_BASE_URL}/sessions`, 
+          formData,
+          { headers }
+        );
+        
+        console.log('Session created:', directSessionResponse.data);
+        onSessionCreated(directSessionResponse.data.id || directSessionResponse.data._id || directSessionResponse.data.session_id);
+        onClose();
+        return;
+      } catch (directSessionError) {
+        console.log('Direct session creation failed, trying workspace flow:', directSessionError);
+        // Continue with workspace flow
+      }
+      
+      // Step 1: Create a new workspace with the database connection details
+      const workspaceRequest = {
+        name: `${formData.db_name} Workspace`,
+        description: `Workspace for ${formData.host} database`,
+        db_connection: {
+          db_name: formData.db_name,
+          username: formData.username,
+          password: formData.password,
+          host: formData.host,
+          port: formData.port,
+          db_type: 'postgresql'
+        }
+      };
+
+      const workspaceResponse = await axios.post(
+        `${API_BASE_URL}/workspaces`, 
+        workspaceRequest,
+        { headers }
+      );
+      
+      console.log('Workspace created:', workspaceResponse.data);
+      const newWorkspaceId = workspaceResponse.data.id || workspaceResponse.data._id;
+      
+      // Step 2: Activate the workspace (connect to database)
+      const activationResponse = await axios.post(
+        `${API_BASE_URL}/workspaces/${newWorkspaceId}/activate`,
+        {}, // Empty body
+        { headers }
+      );
+      
+      console.log('Workspace activated:', activationResponse.data);
+      
+      // Step 3: Create a session in the workspace
+      const sessionRequest = {
+        name: `${formData.db_name} Session`,
+        description: `Session for ${formData.host} database`,
+        workspace_id: newWorkspaceId
+      };
+      
+      const sessionResponse = await axios.post(
+        `${API_BASE_URL}/workspaces/${newWorkspaceId}/sessions`,
+        sessionRequest,
+        { headers }
+      );
+      
+      console.log('Session created:', sessionResponse.data);
+      
+      // Pass the session ID back
+      onSessionCreated(sessionResponse.data.id || sessionResponse.data._id);
       onClose();
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to create session');
+      console.error('Session creation error:', err);
+      let errorMsg = 'Failed to create session';
+      
+      if (err.response) {
+        // The request was made and the server responded with a non-2xx status
+        errorMsg = err.response.data?.detail || `Error: ${err.response.status} ${err.response.statusText}`;
+      } else if (err.request) {
+        // The request was made but no response was received
+        errorMsg = 'No response from server. Please check if the backend is running.';
+      } else {
+        // Something happened in setting up the request
+        errorMsg = err.message || 'Unknown error occurred';
+      }
+      
+      setError(errorMsg);
     } finally {
       setIsLoading(false);
     }
@@ -77,148 +179,100 @@ export default function SessionManager({ onSessionCreated, isOpen, onClose }: Se
           </div>
         )}
         
-        <form onSubmit={handleSubmit} className="space-y-5">
-          {/* Database Name */}
-          <div className="space-y-2">
-            <label className="block text-sm font-semibold text-gray-700">
-              Database Name
-            </label>
-            <input
-              type="text"
-              name="db_name"
-              value={formData.db_name}
-              onChange={handleChange}
-              className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 bg-gray-50 hover:bg-white"
-              placeholder="e.g., postgres, mydb"
-              disabled={isLoading}
-            />
-          </div>
-          
-          {/* Username */}
-          <div className="space-y-2">
-            <label className="block text-sm font-semibold text-gray-700">
-              Username
-            </label>
-            <input
-              type="text"
-              name="username"
-              value={formData.username}
-              onChange={handleChange}
-              className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 bg-gray-50 hover:bg-white"
-              disabled={isLoading}
-            />
-          </div>
-          
-          {/* Password */}
-          <div className="space-y-2">
-            <label className="block text-sm font-semibold text-gray-700">
-              Password
-            </label>
-            <input
-              type="password"
-              name="password"
-              value={formData.password}
-              onChange={handleChange}
-              className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 bg-gray-50 hover:bg-white"
-              disabled={isLoading}
-            />
-          </div>
-          
-          {/* Host and Port */}
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <label className="block text-sm font-semibold text-gray-700">
-                Host
-              </label>
+        {/* Connection Form */}
+        <form onSubmit={handleSubmit} className="space-y-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Database Name</label>
+              <input
+                type="text"
+                name="db_name"
+                value={formData.db_name}
+                onChange={handleChange}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg mt-1"
+                disabled={isLoading}
+              />
+            </div>
+            
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Host</label>
               <input
                 type="text"
                 name="host"
                 value={formData.host}
                 onChange={handleChange}
-                className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 bg-gray-50 hover:bg-white"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg mt-1"
                 disabled={isLoading}
               />
             </div>
-            <div className="space-y-2">
-              <label className="block text-sm font-semibold text-gray-700">
-                Port
-              </label>
+            
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Port</label>
               <input
                 type="text"
                 name="port"
                 value={formData.port}
                 onChange={handleChange}
-                className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200 bg-gray-50 hover:bg-white"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg mt-1"
+                disabled={isLoading}
+              />
+            </div>
+            
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Username</label>
+              <input
+                type="text"
+                name="username"
+                value={formData.username}
+                onChange={handleChange}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg mt-1"
+                disabled={isLoading}
+              />
+            </div>
+            
+            <div>
+              <label className="block text-sm font-medium text-gray-700">Password</label>
+              <input
+                type="password"
+                name="password"
+                value={formData.password}
+                onChange={handleChange}
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg mt-1"
                 disabled={isLoading}
               />
             </div>
           </div>
           
-          {/* Options */}
-          <div className="bg-gradient-to-r from-blue-50 to-indigo-50 p-4 rounded-xl border border-blue-200">
-            <h3 className="text-sm font-semibold text-gray-700 mb-3">Performance Options</h3>
-            <div className="flex items-center justify-between">
-              <label className="flex items-center space-x-3 cursor-pointer">
-                <div className="relative">
-                  <input
-                    type="checkbox"
-                    name="use_memory"
-                    checked={formData.use_memory}
-                    onChange={handleChange}
-                    className="sr-only"
-                    disabled={isLoading}
-                  />
-                  <div className={`w-5 h-5 rounded border-2 transition-all duration-200 ${
-                    formData.use_memory 
-                      ? 'bg-blue-600 border-blue-600' 
-                      : 'border-gray-300 hover:border-blue-400'
-                  }`}>
-                    {formData.use_memory && (
-                      <Check className="h-3 w-3 text-white absolute top-0.5 left-0.5" />
-                    )}
-                  </div>
-                </div>
-                <span className="text-sm font-medium text-gray-700">Use Memory</span>
-              </label>
-              
-              <label className="flex items-center space-x-3 cursor-pointer">
-                <div className="relative">
-                  <input
-                    type="checkbox"
-                    name="use_cache"
-                    checked={formData.use_cache}
-                    onChange={handleChange}
-                    className="sr-only"
-                    disabled={isLoading}
-                  />
-                  <div className={`w-5 h-5 rounded border-2 transition-all duration-200 ${
-                    formData.use_cache 
-                      ? 'bg-blue-600 border-blue-600' 
-                      : 'border-gray-300 hover:border-blue-400'
-                  }`}>
-                    {formData.use_cache && (
-                      <Check className="h-3 w-3 text-white absolute top-0.5 left-0.5" />
-                    )}
-                  </div>
-                </div>
-                <span className="text-sm font-medium text-gray-700">Use Cache</span>
-              </label>
+          <div className="flex items-center space-x-4">
+            <div className="flex items-center">
+              <input
+                type="checkbox"
+                name="use_memory"
+                checked={formData.use_memory}
+                onChange={handleChange}
+                className="h-4 w-4 text-blue-600 border-gray-300 rounded"
+                disabled={isLoading}
+              />
+              <label className="ml-2 text-sm text-gray-700">Use Memory</label>
+            </div>
+            
+            <div className="flex items-center">
+              <input
+                type="checkbox"
+                name="use_cache"
+                checked={formData.use_cache}
+                onChange={handleChange}
+                className="h-4 w-4 text-blue-600 border-gray-300 rounded"
+                disabled={isLoading}
+              />
+              <label className="ml-2 text-sm text-gray-700">Use Cache</label>
             </div>
           </div>
           
-          {/* Buttons */}
-          <div className="flex justify-end gap-3 pt-4">
-            <button
-              type="button"
-              onClick={onClose}
-              className="px-6 py-3 bg-gray-100 hover:bg-gray-200 text-gray-700 font-semibold rounded-xl transition-all duration-200 hover:shadow-md"
-              disabled={isLoading}
-            >
-              Cancel
-            </button>
+          <div className="flex justify-end">
             <button
               type="submit"
-              className="px-6 py-3 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-semibold rounded-xl transition-all duration-200 hover:shadow-lg transform hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none flex items-center space-x-2"
+              className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg flex items-center space-x-2"
               disabled={isLoading}
             >
               {isLoading ? (
@@ -227,10 +281,7 @@ export default function SessionManager({ onSessionCreated, isOpen, onClose }: Se
                   <span>Connecting...</span>
                 </>
               ) : (
-                <>
-                  <Database className="h-4 w-4" />
-                  <span>Connect</span>
-                </>
+                <span>Connect</span>
               )}
             </button>
           </div>

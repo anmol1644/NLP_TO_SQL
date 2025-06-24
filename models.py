@@ -6,21 +6,113 @@ from bson import ObjectId
 from pydantic import BaseModel, Field, EmailStr, validator, field_validator
 from pymongo import MongoClient
 from dotenv import load_dotenv
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
 
 # MongoDB connection
-MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
-client = MongoClient(MONGODB_URL)
-db = client.get_database("nlp_sql")
-
-# Collections
-users_collection = db.users
-workspaces_collection = db.workspaces
-sessions_collection = db.sessions
-messages_collection = db.messages
-
+try:
+    MONGODB_URL = os.getenv("MONGODB_URL")
+    if not MONGODB_URL:
+        logger.warning("MONGODB_URL not found in .env file, using default local connection")
+        MONGODB_URL = "mongodb://localhost:27017"
+    
+    logger.info(f"Connecting to MongoDB using URL: {MONGODB_URL.split('@')[0]}@****")
+    client = MongoClient(MONGODB_URL)
+    
+    # Test connection
+    client.admin.command('ping')
+    logger.info("Successfully connected to MongoDB")
+    
+    db = client.get_database("nlp_sql")
+    
+    # Collections
+    users_collection = db.users
+    workspaces_collection = db.workspaces
+    sessions_collection = db.sessions
+    messages_collection = db.messages
+    
+except Exception as e:
+    logger.error(f"Failed to connect to MongoDB: {str(e)}")
+    # Create fallback in-memory collections for development
+    logger.warning("Using in-memory collections as fallback")
+    
+    class MockCollection:
+        def __init__(self):
+            self.data = []
+            self._id_counter = 1
+        
+        def insert_one(self, document):
+            document["_id"] = str(ObjectId())
+            self.data.append(document)
+            return type("InsertOneResult", (), {"inserted_id": document["_id"]})
+        
+        def find_one(self, query):
+            for item in self.data:
+                if "_id" in query and item.get("_id") == query["_id"]:
+                    return item
+                if "email" in query and item.get("email") == query["email"]:
+                    return item
+            return None
+        
+        def find(self, query=None):
+            if query is None:
+                query = {}
+            
+            results = []
+            for item in self.data:
+                match = True
+                for k, v in query.items():
+                    if k not in item or item[k] != v:
+                        match = False
+                        break
+                if match:
+                    results.append(item)
+            
+            return type("Cursor", (), {
+                "__iter__": lambda self: iter(results),
+                "limit": lambda n: results[:n],
+                "count": lambda: len(results)
+            })
+        
+        def update_one(self, query, update):
+            for i, item in enumerate(self.data):
+                if "_id" in query and item.get("_id") == query["_id"]:
+                    if "$set" in update:
+                        for k, v in update["$set"].items():
+                            self.data[i][k] = v
+                    return type("UpdateResult", (), {"modified_count": 1})
+            return type("UpdateResult", (), {"modified_count": 0})
+        
+        def delete_one(self, query):
+            for i, item in enumerate(self.data):
+                if "_id" in query and item.get("_id") == query["_id"]:
+                    del self.data[i]
+                    return type("DeleteResult", (), {"deleted_count": 1})
+            return type("DeleteResult", (), {"deleted_count": 0})
+    
+    # Create mock collections
+    users_collection = MockCollection()
+    workspaces_collection = MockCollection()
+    sessions_collection = MockCollection()
+    messages_collection = MockCollection()
+    
+    # Add a default admin user
+    default_password = "$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW"  # "password"
+    users_collection.insert_one({
+        "email": "admin@example.com",
+        "hashed_password": default_password,
+        "first_name": "Admin",
+        "is_active": True,
+        "is_admin": True,
+        "created_at": datetime.utcnow()
+    })
+    logger.info("Created default user: admin@example.com with password: password")
 
 # Custom ObjectId field for Pydantic models
 class PyObjectId(str):

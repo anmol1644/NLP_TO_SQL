@@ -1,9 +1,10 @@
 import { useState, useRef, useEffect } from 'react';
-import { Database, MessageSquare, Settings, Wifi, WifiOff } from 'lucide-react';
+import { Database, MessageSquare, Settings, Wifi, WifiOff, BarChart2 } from 'lucide-react';
 import Message from './Message';
 import SqlResult from './SqlResult';
 import SessionManager from './SessionManager';
-import { executeQuery, getSessionInfo, getPaginatedResults } from '../lib/api';
+import Dashboard from './Dashboard';
+import { executeQuery, getSessionInfo, getPaginatedResults, listWorkspaceSessions } from '../lib/api';
 
 // PaginationInfo interface to match the API response
 interface PaginationInfo {
@@ -67,6 +68,8 @@ export default function ChatBot() {
   const [sessionInfo, setSessionInfo] = useState<any>(null);
   const [showSessionManager, setShowSessionManager] = useState(false);
   const [paginationState, setPaginationState] = useState<PaginationState | null>(null);
+  const [showDashboard, setShowDashboard] = useState(false);
+  const [savedQueries, setSavedQueries] = useState<any[]>([]);
   
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -89,6 +92,19 @@ export default function ChatBot() {
     try {
       const info = await getSessionInfo(sessionId);
       setSessionInfo(info);
+      
+      // Check if the info returned is the fallback error object
+      if (info.error) {
+        // Add a message to the chat about the disconnected session
+        const errorMessage: ChatMessage = {
+          id: `session-error-${Date.now()}`,
+          isUser: false,
+          text: `⚠️ ${info.description}`,
+          timestamp: new Date(),
+        };
+        
+        setMessages(prev => [...prev, errorMessage]);
+      }
     } catch (error) {
       console.error('Error fetching session info:', error);
       setSessionId(null);
@@ -237,7 +253,7 @@ export default function ChatBot() {
               ...msg,
               analysisResult: {
                 ...msg.analysisResult,
-                tables: updatedTables,
+                tables: updatedTables
               }
             };
           }
@@ -245,17 +261,30 @@ export default function ChatBot() {
         })
       );
       
-      // Update pagination state
+      // Update the pagination state
       setPaginationState({
         messageId,
         tableId: currentTableId,
-        currentPage: newPage,
+        currentPage: newPage
       });
     } catch (error) {
       console.error('Error fetching paginated results:', error);
+      const errorMessage: ChatMessage = {
+        id: `pagination-error-${Date.now()}`,
+        isUser: false,
+        text: `Error loading page ${newPage}: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        timestamp: new Date(),
+      };
+      
+      setMessages((prev) => [...prev, errorMessage]);
     } finally {
       setIsProcessing(false);
     }
+  };
+
+  // New function to save a query to the dashboard
+  const handleSaveQuery = (query: any) => {
+    setSavedQueries(prev => [...prev, query]);
   };
 
   return (
@@ -276,6 +305,14 @@ export default function ChatBot() {
           </div>
           
           <div className="flex items-center gap-4">
+            <button
+              onClick={() => setShowDashboard(true)}
+              className="flex items-center space-x-2 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white text-sm py-2.5 px-4 rounded-xl shadow-lg transition-all duration-300 transform hover:scale-105 hover:shadow-xl"
+            >
+              <BarChart2 className="h-4 w-4" />
+              <span>Dashboard</span>
+            </button>
+
             {sessionId ? (
               <div className="flex items-center bg-green-50 px-4 py-2 rounded-full border border-green-200 transition-all duration-300 hover:bg-green-100">
                 <Wifi className="h-4 w-4 text-green-600 mr-2" />
@@ -329,6 +366,7 @@ export default function ChatBot() {
                       onPageChange={(page) => handlePageChange(message.id, message.sqlResult?.table_id || '', page)}
                       sessionId={sessionId || undefined}
                       tableId={message.sqlResult.table_id}
+                      onSaveToAnalytics={handleSaveQuery}
                     />
                   </div>
                 )}
@@ -345,6 +383,7 @@ export default function ChatBot() {
                           onPageChange={(page) => handlePageChange(message.id, table.table_id || '', page)}
                           sessionId={sessionId || undefined}
                           tableId={table.table_id}
+                          onSaveToAnalytics={handleSaveQuery}
                         />
                       </div>
                     ))}
@@ -411,6 +450,13 @@ export default function ChatBot() {
         isOpen={showSessionManager}
         onClose={() => setShowSessionManager(false)}
         onSessionCreated={handleSessionCreated}
+      />
+
+      {/* Dashboard */}
+      <Dashboard 
+        isOpen={showDashboard}
+        onClose={() => setShowDashboard(false)}
+        savedQueries={savedQueries}
       />
     </div>
   );

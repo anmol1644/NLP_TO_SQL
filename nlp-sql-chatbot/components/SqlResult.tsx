@@ -1,5 +1,7 @@
-import { AlertTriangle, CheckCircle, Database, Copy, Download, ChevronLeft, ChevronRight } from 'lucide-react';
+import { AlertTriangle, CheckCircle, Database, Copy, Download, ChevronLeft, ChevronRight, BarChart, Lightbulb, BookmarkPlus } from 'lucide-react';
 import { useState } from 'react';
+import Visualization from './Visualization';
+import InsightPanel from './InsightPanel';
 
 interface PaginationInfo {
   table_id: string;
@@ -21,6 +23,7 @@ interface SqlResultProps {
   onPageChange?: (page: number) => void;
   sessionId?: string;
   tableId?: string;
+  onSaveToAnalytics?: (query: any) => void;
 }
 
 export default function SqlResult({ 
@@ -32,9 +35,13 @@ export default function SqlResult({
   pagination,
   onPageChange,
   sessionId,
-  tableId
+  tableId,
+  onSaveToAnalytics
 }: SqlResultProps) {
   const [copied, setCopied] = useState(false);
+  const [showVisualization, setShowVisualization] = useState(false);
+  const [showInsights, setShowInsights] = useState(true);
+  const [isSaved, setIsSaved] = useState(false);
 
   const copyToClipboard = async (text: string) => {
     try {
@@ -47,9 +54,36 @@ export default function SqlResult({
   };
 
   const handlePageChange = (newPage: number) => {
-    if (onPageChange && pagination) {
-      console.log(`SqlResult requesting page ${newPage} for table ${tableId || pagination.table_id}`);
-      onPageChange(newPage);
+    if (onPageChange && (pagination || tableId)) {
+      // Use the tableId from props if available, otherwise from pagination
+      const effectiveTableId = tableId || (pagination ? pagination.table_id : null);
+      
+      if (effectiveTableId) {
+        console.log(`SqlResult requesting page ${newPage} for table ${effectiveTableId}`);
+        onPageChange(newPage);
+      } else {
+        console.error('Cannot change page: missing table ID');
+      }
+    }
+  };
+
+  const handleSaveToAnalytics = () => {
+    if (onSaveToAnalytics && data) {
+      const savedQuery = {
+        id: `query-${Date.now()}`,
+        title: title || "Saved Query",
+        description: description || "",
+        sql,
+        data,
+        timestamp: new Date().toISOString(),
+        tableName: tableId
+      };
+      
+      onSaveToAnalytics(savedQuery);
+      setIsSaved(true);
+      
+      // Reset saved status after a while
+      setTimeout(() => setIsSaved(false), 3000);
     }
   };
 
@@ -153,6 +187,36 @@ export default function SqlResult({
             <Download className="h-3 w-3" />
             <span>Export</span>
           </button>
+          <button
+            onClick={() => setShowVisualization(true)}
+            className="flex items-center space-x-1 text-xs text-blue-600 hover:text-blue-800 bg-blue-100 hover:bg-blue-200 px-3 py-1 rounded-lg transition-all duration-200"
+          >
+            <BarChart className="h-3 w-3" />
+            <span>Visualize</span>
+          </button>
+          <button
+            onClick={() => setShowInsights(!showInsights)}
+            className={`flex items-center space-x-1 text-xs ${
+              showInsights ? 'text-indigo-600 hover:text-indigo-800 bg-indigo-100 hover:bg-indigo-200' : 'text-gray-600 hover:text-gray-800 bg-gray-100 hover:bg-gray-200'
+            } px-3 py-1 rounded-lg transition-all duration-200`}
+          >
+            <Lightbulb className="h-3 w-3" />
+            <span>{showInsights ? 'Hide Insights' : 'Show Insights'}</span>
+          </button>
+          {onSaveToAnalytics && (
+            <button
+              onClick={handleSaveToAnalytics}
+              disabled={isSaved}
+              className={`flex items-center space-x-1 text-xs ${
+                isSaved 
+                  ? 'text-purple-800 bg-purple-200 cursor-default' 
+                  : 'text-purple-600 hover:text-purple-800 bg-purple-100 hover:bg-purple-200'
+              } px-3 py-1 rounded-lg transition-all duration-200`}
+            >
+              <BookmarkPlus className="h-3 w-3" />
+              <span>{isSaved ? 'Saved!' : 'Save to Dashboard'}</span>
+            </button>
+          )}
         </div>
       </div>
       
@@ -240,6 +304,13 @@ export default function SqlResult({
         </div>
       )}
       
+      {/* Insights Panel */}
+      {showInsights && data && data.length > 0 && (
+        <div className="mt-6">
+          <InsightPanel data={data} tableName={tableId} query={sql} />
+        </div>
+      )}
+      
       {/* SQL Query Section */}
       <div className="mt-6 pt-4 border-t border-emerald-200">
         <div className="flex items-center justify-between mb-3">
@@ -259,6 +330,11 @@ export default function SqlResult({
           <pre className="text-sm text-emerald-700 font-mono leading-relaxed">{sql}</pre>
         </div>
       </div>
+      
+      {/* Visualization Modal */}
+      {showVisualization && (
+        <Visualization data={data} onClose={() => setShowVisualization(false)} />
+      )}
     </div>
   );
 }
