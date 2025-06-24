@@ -7,7 +7,7 @@ import uvicorn
 from fastapi import FastAPI, Depends, HTTPException, status, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from smart_sql import SmartSQLGenerator
 from db_analyzer import DatabaseAnalyzer
@@ -34,6 +34,14 @@ active_sessions: Dict[str, Dict[str, Any]] = {}
 
 # Session cleanup interval (in minutes)
 SESSION_TIMEOUT = 60  # 1 hour
+
+
+class TableInfo(BaseModel):
+    """Information about a table returned in multi-query analysis"""
+    name: str = Field(description="The name/title of the table")
+    description: str = Field(description="Description of what this table contains")
+    sql: str = Field(description="The SQL query used to generate this table")
+    results: List[Dict[str, Any]] = Field(description="The query results for this table")
 
 
 class QueryRequest(BaseModel):
@@ -214,13 +222,70 @@ def query_without_session(query_req: QueryRequest):
             max_attempts=query_req.max_attempts
         )
         
-        return result
+        # Process and standardize the result
+        return format_query_result(result)
     
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Query execution failed: {str(e)}"
         )
+
+
+def format_query_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Format and standardize query result for API response"""
+    response = {
+        "success": result.get("success", False),
+        "question": result.get("question", ""),
+        "text": result.get("text", ""),
+        "execution_time": result.get("execution_time", 0),
+    }
+    
+    # Include pagination metadata if available
+    if "pagination" in result:
+        response["pagination"] = result["pagination"]
+    
+    # For conversational queries, just return the text
+    if result.get("is_conversational", False):
+        response["query_type"] = "conversational"
+        return response
+    
+    # For multi-query analysis, format tables with headers
+    if result.get("is_multi_query", False) or result.get("is_why_analysis", False):
+        response["query_type"] = "analysis"
+        response["is_multi_query"] = True  # Ensure flag is set
+        
+        # Add special flag for "why" questions
+        if result.get("is_why_analysis", False):
+            response["analysis_type"] = "causal"
+        else:
+            response["analysis_type"] = "comparative"
+        
+        # Format tables with proper metadata
+        tables = []
+        for table_data in result.get("tables", []):
+            table = {
+                "name": table_data.get("query_name", "Unnamed Table"),
+                "description": table_data.get("description", ""),
+                "sql": table_data.get("sql", ""),
+                "results": table_data.get("results", []),
+                "row_count": table_data.get("row_count", len(table_data.get("results", [])))
+            }
+            tables.append(table)
+        
+        response["tables"] = tables
+        return response
+    
+    # For standard SQL queries, include the SQL and results
+    response["query_type"] = "sql"
+    response["sql"] = result.get("sql", "")
+    response["results"] = result.get("results", [])
+    
+    # Include error message if query failed
+    if not response["success"]:
+        response["error"] = result.get("error", "Unknown error")
+    
+    return response
 
 
 @app.post("/sessions/{session_id}/query")
@@ -230,14 +295,16 @@ def query_with_session(session_id: str, query_req: QueryRequest):
     sql_generator = get_sql_generator(session_id)
     
     try:
-        # Execute the query
+        # Execute the query - the SQL generator will automatically determine
+        # if this is a conversational query, SQL query, or multi-query analysis
         result = sql_generator.execute_query(
             query_req.question,
             auto_fix=query_req.auto_fix,
             max_attempts=query_req.max_attempts
         )
         
-        return result
+        # Process and standardize the result
+        return format_query_result(result)
     
     except Exception as e:
         raise HTTPException(
@@ -270,6 +337,32 @@ def list_sessions():
         "total": len(sessions),
         "expired_removed": expired_count
     }
+
+
+@app.get("/sessions/{session_id}/results/{table_id}")
+def get_paginated_results(session_id: str, table_id: str, page: int = 1, page_size: int = 10):
+    """Get a specific page of results for a previously executed query"""
+    # Get the SQL generator for this session
+    sql_generator = get_sql_generator(session_id)
+    
+    try:
+        # Get the paginated results
+        result = sql_generator.get_paginated_results(table_id, page, page_size)
+        
+        if not result["success"]:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=result.get("error", "Table not found")
+            )
+        
+        # Format the response
+        return format_query_result(result)
+    
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve paginated results: {str(e)}"
+        )
 
 
 if __name__ == "__main__":
