@@ -3,6 +3,7 @@ import pandas as pd
 from sqlalchemy import create_engine, inspect, MetaData, text
 from sqlalchemy.ext.automap import automap_base
 from typing import Dict, List, Any, Tuple, Optional
+from urllib.parse import quote_plus
 
 
 class DatabaseAnalyzer:
@@ -30,11 +31,17 @@ class DatabaseAnalyzer:
             port: PostgreSQL port
         """
         self.db_name = db_name
-        self.connection_string = f"postgresql://{username}:{password}@{host}:{port}/{db_name}"
-        self.engine = create_engine(self.connection_string)
-        self.metadata = MetaData()
-        self.inspector = inspect(self.engine)
-        self.schema_info = None
+        # URL encode the password to handle special characters
+        encoded_password = quote_plus(password)
+        self.connection_string = f"postgresql://{username}:{encoded_password}@{host}:{port}/{db_name}"
+        try:
+            self.engine = create_engine(self.connection_string)
+            self.metadata = MetaData()
+            self.inspector = inspect(self.engine)
+            self.schema_info = None
+        except Exception as e:
+            print(f"Error creating database engine: {str(e)}")
+            raise
         
     def analyze_schema(self) -> Dict[str, Any]:
         """

@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
 from sqlalchemy.dialects.postgresql import NUMERIC
+from urllib.parse import quote_plus
 
 # Base class for SQLAlchemy ORM
 Base = declarative_base()
@@ -95,9 +96,15 @@ class Database:
             port: PostgreSQL port
         """
         self.db_name = db_name
-        self.connection_string = f"postgresql://{username}:{password}@{host}:{port}/{db_name}"
-        self.engine = create_engine(self.connection_string)
-        self.Session = sessionmaker(bind=self.engine)
+        # URL encode the password to handle special characters
+        encoded_password = quote_plus(password)
+        self.connection_string = f"postgresql://{username}:{encoded_password}@{host}:{port}/{db_name}"
+        try:
+            self.engine = create_engine(self.connection_string)
+            self.Session = sessionmaker(bind=self.engine)
+        except Exception as e:
+            print(f"Error creating database engine: {str(e)}")
+            raise
         
     def create_tables(self):
         """Create all tables in the database"""
